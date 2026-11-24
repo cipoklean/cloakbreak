@@ -1,0 +1,358 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CloakBreak — Live Voice Deepfake Shield</title>
+  <style>
+    :root {
+      --bg: #0c0e12;
+      --panel: #151922;
+      --border: #262c3a;
+      --text: #e6e9ef;
+      --muted: #8b95a7;
+      --safe: #22c55e;
+      --warn: #f59e0b;
+      --danger: #ef4444;
+      --accent: #38bdf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 960px; margin: 0 auto; }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      flex-wrap: wrap;
+      gap: 12px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+      margin-bottom: 20px;
+    }
+    h1 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
+    .badge {
+      font-size: 12px;
+      padding: 4px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      color: var(--accent);
+      background: var(--panel);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+    .score { font-size: 36px; font-weight: 700; margin: 6px 0; }
+    .bar-track {
+      height: 10px;
+      background: #0b0d11;
+      border-radius: 4px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+    }
+    .bar-fill { height: 100%; width: 0%; transition: width 120ms linear, background 120ms linear; background: var(--safe); }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+    button, select, input[type="file"], input[type="text"], input[type="password"] {
+      background: var(--panel);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 14px;
+      font-family: inherit;
+      font-size: 13px;
+    }
+    button { cursor: pointer; }
+    button.primary { background: #1d4ed8; border-color: #2563eb; color: #fff; }
+    button.danger { background: #991b1b; border-color: #dc2626; color: #fff; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    canvas {
+      width: 100%;
+      height: 180px;
+      display: block;
+      background: #090b0f;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .caption { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    .hidden { display: none; }
+    .meta-row { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 8px; }
+    .meta-row strong { color: var(--text); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <h1>CloakBreak</h1>
+        <div class="caption">Real-time, codec-hardened voice deepfake detection</div>
+      </div>
+      <div class="badge" id="backendBadge">backend: connecting...</div>
+    </header>
+
+    <div class="controls">
+      <button id="micBtn" class="primary">Start Live Mic</button>
+      <label class="caption" for="conditionSel">Channel:</label>
+      <select id="conditionSel">
+        <option value="clean">Clean (16 kHz)</option>
+        <option value="opus_16k">Opus 16 kbps</option>
+        <option value="phone_8k">Phone 8 kHz (G.711)</option>
+      </select>
+      <input type="file" id="wavInput" accept=".wav,audio/wav" />
+      <button id="uploadBtn">Analyze WAV</button>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <div class="label">CloakBreak (Spoof Probability)</div>
+        <div class="score" id="cbScore">--</div>
+        <div class="bar-track"><div class="bar-fill" id="cbBar"></div></div>
+        <div class="meta-row">
+          <span>Verdict: <strong id="cbVerdict">Waiting</strong></span>
+          <span>Latency: <strong id="latencyVal">-- ms</strong></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="label">Legacy Baseline (Side-by-Side)</div>
+        <div class="score" id="baseScore">N/A</div>
+        <div class="bar-track"><div class="bar-fill" id="baseBar"></div></div>
+        <div class="meta-row">
+          <span>Model: <strong id="baseModel">Not loaded</strong></span>
+          <span>Speech VAD: <strong id="vadStatus">--</strong></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom: 16px;">
+      <div class="label">Model Attention Focus (Where the Model Attended Across the 2.5s Window)</div>
+      <canvas id="focusCanvas" width="900" height="180"></canvas>
+      <div class="caption">
+        Bar height shows relative temporal attention weight per frame window. Attention reflects where the model focused, not ground-truth proof of spliced frames.
+      </div>
+    </div>
+
+    <div class="card hidden" id="clonePanel">
+      <div class="label">Private Self-Clone Arena (Owner Only — Auth-Gated)</div>
+      <div class="controls" style="margin-top: 10px;">
+        <input type="password" id="cloneToken" placeholder="Bearer token" />
+        <input type="text" id="cloneText" placeholder="Text to synthesize in your voice" style="flex: 1; min-width: 220px;" />
+        <input type="file" id="cloneRefWav" accept=".wav,audio/wav" />
+        <button id="cloneBtn" class="danger">Generate &amp; Analyze Clone</button>
+      </div>
+      <audio id="cloneAudio" controls style="width: 100%; margin-top: 8px;"></audio>
+    </div>
+  </div>
+
+  <script>
+    const els = {
+      backendBadge: document.getElementById("backendBadge"),
+      micBtn: document.getElementById("micBtn"),
+      conditionSel: document.getElementById("conditionSel"),
+      wavInput: document.getElementById("wavInput"),
+      uploadBtn: document.getElementById("uploadBtn"),
+      cbScore: document.getElementById("cbScore"),
+      cbBar: document.getElementById("cbBar"),
+      cbVerdict: document.getElementById("cbVerdict"),
+      latencyVal: document.getElementById("latencyVal"),
+      baseScore: document.getElementById("baseScore"),
+      baseBar: document.getElementById("baseBar"),
+      baseModel: document.getElementById("baseModel"),
+      vadStatus: document.getElementById("vadStatus"),
+      canvas: document.getElementById("focusCanvas"),
+      clonePanel: document.getElementById("clonePanel"),
+      cloneToken: document.getElementById("cloneToken"),
+      cloneText: document.getElementById("cloneText"),
+      cloneRefWav: document.getElementById("cloneRefWav"),
+      cloneBtn: document.getElementById("cloneBtn"),
+      cloneAudio: document.getElementById("cloneAudio"),
+    };
+
+    const ctx2d = els.canvas.getContext("2d");
+    let ws = null;
+    let audioCtx = null;
+    let mediaStream = null;
+    let processor = null;
+
+    function colorForProb(p) {
+      if (p >= 0.65) return "#ef4444";
+      if (p >= 0.35) return "#f59e0b";
+      return "#22c55e";
+    }
+
+    function drawAttention(focus, prob) {
+      const w = els.canvas.width;
+      const h = els.canvas.height;
+      ctx2d.clearRect(0, 0, w, h);
+      const bins = focus && focus.length ? focus : new Array(32).fill(0);
+      const barW = w / bins.length;
+      const color = prob == null ? "#334155" : colorForProb(prob);
+      bins.forEach((v, i) => {
+        const bh = Math.max(2, v * (h - 24));
+        ctx2d.fillStyle = color;
+        ctx2d.globalAlpha = 0.25 + 0.75 * v;
+        ctx2d.fillRect(i * barW + 2, h - bh - 8, Math.max(2, barW - 4), bh);
+      });
+      ctx2d.globalAlpha = 1.0;
+    }
+
+    function renderResult(data) {
+      els.vadStatus.textContent = data.is_speech ? "Speech" : "Silence";
+      els.latencyVal.textContent = `${data.latency_ms ?? 0} ms`;
+      if (data.spoof_prob == null) {
+        els.cbScore.textContent = "--";
+        els.cbVerdict.textContent = "Listening (silence)";
+        els.cbBar.style.width = "0%";
+      } else {
+        const pct = Math.round(data.spoof_prob * 100);
+        els.cbScore.textContent = `${pct}%`;
+        els.cbBar.style.width = `${pct}%`;
+        els.cbBar.style.background = colorForProb(data.spoof_prob);
+        els.cbVerdict.textContent = data.spoof_prob >= 0.5 ? "SPOOF" : "BONAFIDE";
+      }
+      if (data.baseline_prob != null) {
+        const bpct = Math.round(data.baseline_prob * 100);
+        els.baseScore.textContent = `${bpct}%`;
+        els.baseBar.style.width = `${bpct}%`;
+        els.baseBar.style.background = colorForProb(data.baseline_prob);
+      }
+      drawAttention(data.attention_focus, data.spoof_prob);
+    }
+
+    async function fetchHealth() {
+      const res = await fetch("/api/health");
+      const data = await res.json();
+      els.backendBadge.textContent = `backend: ${data.backend}`;
+      els.baseModel.textContent = data.baseline_loaded ? data.baseline_id : "Not loaded";
+      if (data.clone_enabled) {
+        els.clonePanel.classList.remove("hidden");
+      }
+    }
+
+    function downsampleTo16k(float32, inRate) {
+      if (inRate === 16000) return float32;
+      const ratio = inRate / 16000;
+      const outLen = Math.floor(float32.length / ratio);
+      const out = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        out[i] = float32[Math.floor(i * ratio)];
+      }
+      return out;
+    }
+
+    function floatToPcm16(float32) {
+      const buf = new ArrayBuffer(float32.length * 2);
+      const view = new DataView(buf);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+      }
+      return buf;
+    }
+
+    async function stopMic() {
+      if (processor) { processor.disconnect(); processor = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      if (audioCtx) { await audioCtx.close(); audioCtx = null; }
+      if (ws) { ws.close(); ws = null; }
+      els.micBtn.textContent = "Start Live Mic";
+      els.micBtn.className = "primary";
+    }
+
+    els.micBtn.addEventListener("click", async () => {
+      if (ws) { await stopMic(); return; }
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      ws = new WebSocket(`${proto}://${location.host}/ws/detect`);
+      ws.onmessage = (ev) => {
+        const data = JSON.parse(ev.data);
+        if (data.type === "prediction") renderResult(data);
+      };
+      ws.onopen = async () => {
+        ws.send(JSON.stringify({ condition: els.conditionSel.value }));
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        audioCtx = new AudioContext();
+        const src = audioCtx.createMediaStreamSource(mediaStream);
+        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        processor.onaudioprocess = (ev) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          const mono = ev.inputBuffer.getChannelData(0);
+          const ds = downsampleTo16k(mono, audioCtx.sampleRate);
+          ws.send(floatToPcm16(ds));
+        };
+        src.connect(processor);
+        processor.connect(audioCtx.destination);
+        els.micBtn.textContent = "Stop Live Mic";
+        els.micBtn.className = "danger";
+      };
+      ws.onclose = () => stopMic();
+    });
+
+    els.conditionSel.addEventListener("change", () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ condition: els.conditionSel.value }));
+      }
+    });
+
+    els.uploadBtn.addEventListener("click", async () => {
+      const f = els.wavInput.files[0];
+      if (!f) return;
+      const fd = new FormData();
+      fd.append("file", f);
+      fd.append("condition", els.conditionSel.value);
+      const res = await fetch("/api/detect-file", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) { alert(data.detail || "Detection failed"); return; }
+      renderResult(data);
+    });
+
+    els.cloneBtn.addEventListener("click", async () => {
+      const f = els.cloneRefWav.files[0];
+      const text = els.cloneText.value.trim();
+      const token = els.cloneToken.value.trim();
+      if (!f || !text || !token) { alert("Provide token, text, and reference WAV"); return; }
+      els.cloneBtn.disabled = true;
+      try {
+        const fd = new FormData();
+        fd.append("text", text);
+        fd.append("reference_wav", f);
+        fd.append("condition", els.conditionSel.value);
+        const res = await fetch("/api/clone", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${token}` },
+          body: fd,
+        });
+        if (!res.ok) { alert(await res.text()); return; }
+        const blob = await res.blob();
+        els.cloneAudio.src = URL.createObjectURL(blob);
+        els.cloneAudio.play();
+
+        const detectFd = new FormData();
+        detectFd.append("file", new File([blob], "clone.wav", { type: "audio/wav" }));
+        detectFd.append("condition", "clean");
+        const detRes = await fetch("/api/detect-file", { method: "POST", body: detectFd });
+        renderResult(await detRes.json());
+      } finally {
+        els.cloneBtn.disabled = false;
+      }
+    });
+
+    drawAttention([], null);
+    fetchHealth();
+  </script>
+</body>
+</html>

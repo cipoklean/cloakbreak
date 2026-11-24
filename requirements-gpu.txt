@@ -1,0 +1,32 @@
+# Pinned GPU dependencies verified conflict-free for x86_64 Linux + Python 3.11
+# Target Vast.ai image: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
+# (already ships torch==2.6.0 and torchaudio==2.6.0 matching chatterbox-tts==0.1.7)
+
+torch==2.6.0
+torchaudio==2.6.0
+chatterbox-tts==0.1.7
+kokoro==0.9.4
+misaki[en]==0.9.4
+transformers==5.2.0
+datasets==5.2.0
+accelerate==1.16.0
+huggingface-hub==1.33.0
+safetensors==0.5.3
+diffusers==0.29.0
+librosa==0.11.0
+s3tokenizer==0.3.0
+resemble-perth==1.0.1
+conformer==0.3.2
+pykakasi==2.3.0
+spacy==3.8.18
+numpy==1.26.4
+scipy==1.17.1
+soundfile==0.14.0
+onnx==1.23.2
+onnxruntime==1.32.0
+fastapi==0.163.2
+uvicorn[standard]==0.54.0
+websockets==15.0.1
+python-multipart==0.0.34
+pydantic==2.14.4
+tqdm==4.70.1
