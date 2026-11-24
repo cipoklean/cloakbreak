@@ -14,7 +14,7 @@ idle storage charges).
 | Session | Date (WAT) | GPU Type | Vast Instance ID | Purpose | Active Hours | Rate ($/hr) | Disk/Net ($) | Session Cost ($) | Cumulative ($) | Artifacts Pushed | Destroyed? |
 | :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :---: |
 | 0 (Prep) | 2026-11-24 | Oracle ARM CPU | N/A | Day 0 scaffold & CPU unit tests | 0.00 | $0.00 | $0.00 | $0.00 | $0.00 | Local repo scaffold | N/A |
-| 1 | TBD | 1x RTX 3090 | TBD | Dataset download + Chatterbox/Kokoro spoof generation + smoke test | TBD | TBD | TBD | TBD | TBD | HF dataset manifest | TBD |
+| 1 | 2026-11-24 | 1x RTX 4090 | `62414627` | Dataset download + Chatterbox/Kokoro spoof generation + smoke test (in progress) | TBD | TBD | TBD | TBD | TBD | HF dataset manifest | Active |
 | 2 | TBD | 1x RTX 3090 | TBD | Baseline evals + WavLM training + INT8 ONNX export | TBD | TBD | TBD | TBD | TBD | HF checkpoint + ONNX | TBD |
 | 3 | TBD | 1x RTX 3090 | TBD | Held-out & honest-limits evals + live Arena test | TBD | TBD | TBD | TBD | TBD | `eval/results.json` | TBD |
 | 4 | TBD | 1x RTX 3090 | TBD | Unedited live demo video capture | TBD | TBD | TBD | TBD | TBD | Final demo video | TBD |

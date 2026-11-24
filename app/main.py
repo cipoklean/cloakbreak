@@ -158,8 +158,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="Reference WAV must be non-empty and <= 5 MB")
         ref_wav, sr = load_wav_bytes_mono(raw, target_sr=TARGET_SR)
         dur = ref_wav.shape[0] / float(sr)
-        if dur < 1.5 or dur > 15.0:
-            raise HTTPException(status_code=400, detail="Reference clip must be between 1.5s and 15s")
+        if dur < 5.5 or dur > 15.0:
+            raise HTTPException(status_code=400, detail="Reference clip must be between 5.5s and 15s (Chatterbox requires > 5s)")
 
         if ctx.detector.backend_name == "mock":
             from src.generate_spoofs import synthesize_mock_clone

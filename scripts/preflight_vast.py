@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import shutil
 import subprocess
 import sys
@@ -11,15 +12,67 @@ import numpy as np
 
 from src.audio_utils import TARGET_SR, save_wav_mono
 
+REQUIRED_IMPORTS = [
+    "numpy",
+    "scipy",
+    "soundfile",
+    "librosa",
+    "pyarrow",
+    "pandas",
+    "datasets",
+    "torch",
+    "torchaudio",
+    "transformers",
+    "accelerate",
+    "huggingface_hub",
+    "safetensors",
+    "diffusers",
+    "chatterbox",
+    "chatterbox.tts_turbo",
+    "kokoro",
+    "misaki",
+    "spacy",
+    "onnx",
+    "onnxruntime",
+    "sklearn",
+    "gradio",
+    "fastapi",
+    "uvicorn",
+    "websockets",
+    "tqdm",
+    "src.audio_utils",
+    "src.augment",
+    "src.model",
+    "src.generate_spoofs",
+    "src.train",
+    "src.eval",
+    "app.main",
+]
+
 
 def _step(name: str) -> None:
     print(f"\n[preflight] {name}...", flush=True)
 
 
+def run_import_sweep() -> None:
+    failures: list[str] = []
+    for mod_name in REQUIRED_IMPORTS:
+        try:
+            mod = importlib.import_module(mod_name)
+            ver = getattr(mod, "__version__", None)
+            ver_str = f"=={ver}" if ver else ""
+            print(f"  OK  {mod_name}{ver_str}", flush=True)
+        except Exception as exc:
+            print(f"  ERR {mod_name}: {exc}", flush=True)
+            failures.append(f"{mod_name}: {exc}")
+    if failures:
+        sys.exit("PREFLIGHT FAIL (import sweep):\n  " + "\n  ".join(failures))
+
+
 def main() -> None:
     t_start = time.perf_counter()
 
-    _step("1/6 System binaries (nvidia-smi, ffmpeg libopus, espeak-ng)")
+    _step("1/7 System binaries (nvidia-smi, ffmpeg libopus, espeak-ng)")
     for binary in ("nvidia-smi", "ffmpeg", "espeak-ng"):
         if shutil.which(binary) is None:
             sys.exit(f"PREFLIGHT FAIL: required binary '{binary}' not found on PATH.")
@@ -37,7 +90,10 @@ def main() -> None:
         sys.exit("PREFLIGHT FAIL: ffmpeg does not have libopus enabled.")
     print("  ffmpeg libopus: OK | espeak-ng: OK")
 
-    _step("2/6 PyTorch & CUDA availability")
+    _step("2/7 Full import sweep (Sessions 1-4 modules + NumPy/PyArrow ABI check)")
+    run_import_sweep()
+
+    _step("3/7 PyTorch & CUDA availability")
     import torch
 
     print(f"  torch={torch.__version__} cuda_available={torch.cuda.is_available()} cuda_version={torch.version.cuda}")
@@ -46,18 +102,20 @@ def main() -> None:
     free_b, total_b = torch.cuda.mem_get_info()
     print(f"  VRAM: {free_b / 1e9:.1f} GB free / {total_b / 1e9:.1f} GB total")
 
-    _step("3/6 Synthetic reference clip")
+    _step("4/7 Synthetic 6.0s reference clip (Chatterbox-Turbo requires > 5.0s)")
     tmpdir = Path(tempfile.mkdtemp(prefix="cloakbreak_preflight_"))
-    ref_wav = tmpdir / "ref.wav"
-    t = np.linspace(0.0, 2.0, TARGET_SR * 2, endpoint=False, dtype=np.float32)
+    ref_wav = tmpdir / "ref_6s.wav"
+    t = np.linspace(0.0, 6.0, TARGET_SR * 6, endpoint=False, dtype=np.float32)
     wave = (0.25 * np.sin(2.0 * np.pi * 210.0 * t)).astype(np.float32)
     save_wav_mono(ref_wav, wave, TARGET_SR)
 
-    _step("4/6 Load Chatterbox-Turbo on CUDA & synthesize 1 test clip")
+    _step("5/7 Load Chatterbox-Turbo on CUDA & synthesize 1 test clip")
     try:
         from chatterbox.tts_turbo import ChatterboxTurboTTS
+        from src.generate_spoofs import _NoOpWatermarker
 
         cb = ChatterboxTurboTTS.from_pretrained(device="cuda")
+        cb.watermarker = _NoOpWatermarker()
         out_cb = cb.generate("Preflight voice check on Vast.", audio_prompt_path=str(ref_wav))
         arr_cb = out_cb.squeeze().detach().cpu().numpy()
         if arr_cb.size < 1000 or not np.isfinite(arr_cb).all():
@@ -68,7 +126,7 @@ def main() -> None:
     except Exception as exc:
         sys.exit(f"PREFLIGHT FAIL (Chatterbox): {exc}")
 
-    _step("5/6 Load Kokoro-82M & synthesize 1 test clip")
+    _step("6/7 Load Kokoro-82M & synthesize 1 test clip")
     try:
         from kokoro import KPipeline
 
@@ -83,7 +141,7 @@ def main() -> None:
     except Exception as exc:
         sys.exit(f"PREFLIGHT FAIL (Kokoro): {exc}")
 
-    _step("6/6 Load microsoft/wavlm-base-plus CloakBreakDetector & run 1 CUDA forward pass")
+    _step("7/7 Load microsoft/wavlm-base-plus CloakBreakDetector & run 1 CUDA forward pass")
     try:
         from src.model import DEFAULT_BACKBONE_ID, DEFAULT_WINDOW_SAMPLES, CloakBreakDetector
 
@@ -101,7 +159,7 @@ def main() -> None:
 
     shutil.rmtree(tmpdir, ignore_errors=True)
     elapsed = time.perf_counter() - t_start
-    print(f"\nPREFLIGHT PASSED in {elapsed:.1f}s — ready for GPU Session 1.", flush=True)
+    print(f"\nPREFLIGHT PASSED in {elapsed:.1f}s — ready for GPU work.", flush=True)
 
 
 if __name__ == "__main__":

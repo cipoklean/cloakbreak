@@ -24,6 +24,10 @@ from src.audio_utils import (
 DEFAULT_TEXT_DATASET = "agentlans/high-quality-english-sentences"
 # Open, non-gated clean read-speech corpus (license: CC-BY-4.0, Parquet streaming)
 DEFAULT_CLEAN_REAL_DATASET = "openslr/librispeech_asr"
+# chatterbox-tts 0.1.7 tts_turbo.py asserts len(ref)/sr > 5.0
+CHATTERBOX_MIN_REF_S = 5.5
+CHATTERBOX_MAX_REF_S = 10.0
+MAX_SKIP_RATIO = 0.05
 
 # Reserved strictly for the live UI demo — NEVER used in training or evaluation.
 DEMO_PROMPTS = [
@@ -429,7 +433,7 @@ def _stream_librispeech_clean(
                 "duration_s": round(dur, 3),
             }
             clean_records.append(rec)
-            if 3.0 <= dur <= 9.0:
+            if CHATTERBOX_MIN_REF_S <= dur <= CHATTERBOX_MAX_REF_S:
                 clean_refs.append(rec)
             kept += 1
             pbar.update(1)
@@ -547,7 +551,7 @@ def build_from_hf_on_gpu(
             "duration_s": round(dur, 3),
         }
         records.append(rec)
-        if label == 0 and 3.0 <= dur <= 9.0:
+        if label == 0 and CHATTERBOX_MIN_REF_S <= dur <= CHATTERBOX_MAX_REF_S:
             wild_refs.append(rec)
         kept_itw += 1
         pbar.update(1)
@@ -580,7 +584,12 @@ def build_from_hf_on_gpu(
             bonafide_refs.append(wild_refs[k])
 
     # 3. Unwatermarked Chatterbox-Turbo clones (disjoint text per clip)
-    if max_chatterbox > 0 and bonafide_refs:
+    if max_chatterbox > 0:
+        if not bonafide_refs:
+            raise RuntimeError(
+                f"No bonafide reference clips found in {CHATTERBOX_MIN_REF_S}-{CHATTERBOX_MAX_REF_S}s range "
+                "for Chatterbox-Turbo (requires > 5.0s)."
+            )
         missing_cb = [i for i in range(max_chatterbox) if not (cb_dir / f"cb_{i:05d}.wav").exists()]
         cb_model = None
         if missing_cb:
@@ -596,7 +605,7 @@ def build_from_hf_on_gpu(
                 print("[watermark] Chatterbox Perth watermarker ENABLED.", flush=True)
             print(
                 f"Generating {len(missing_cb)}/{max_chatterbox} Chatterbox clones "
-                f"({max_chatterbox - len(missing_cb)} already on disk)...",
+                f"({max_chatterbox - len(missing_cb)} already on disk; refs={len(bonafide_refs)})...",
                 flush=True,
             )
         else:
@@ -604,6 +613,8 @@ def build_from_hf_on_gpu(
 
         t_cb = time.perf_counter()
         generated_cb = 0
+        skipped_cb = 0
+        max_allowed_cb_skips = int(max_chatterbox * MAX_SKIP_RATIO)
         for i in tqdm(range(max_chatterbox)):
             ref = bonafide_refs[i % len(bonafide_refs)]
             prompt = cb_sentences[i]
@@ -618,6 +629,12 @@ def build_from_hf_on_gpu(
                     generated_cb += 1
                 dur = _wav_duration_s(out_path)
                 if dur < min_duration_s:
+                    skipped_cb += 1
+                    if skipped_cb > max_allowed_cb_skips:
+                        raise RuntimeError(
+                            f"Chatterbox skipped {skipped_cb}/{max_chatterbox} clips "
+                            f"(>{MAX_SKIP_RATIO * 100:.0f}% threshold; last reason: duration {dur}s < {min_duration_s}s)."
+                        )
                     continue
                 records.append({
                     "id": f"cb_{i}",
@@ -631,11 +648,21 @@ def build_from_hf_on_gpu(
                     "duration_s": dur,
                 })
             except Exception as exc:
-                print(f"[warn] Chatterbox clip {i} skipped: {exc}", flush=True)
+                skipped_cb += 1
+                print(f"[warn] Chatterbox clip {i} skipped ({skipped_cb}/{max_allowed_cb_skips} allowed): {exc}", flush=True)
+                if skipped_cb > max_allowed_cb_skips:
+                    raise RuntimeError(
+                        f"Chatterbox failure threshold exceeded: {skipped_cb}/{max_chatterbox} clips skipped "
+                        f"(limit {MAX_SKIP_RATIO * 100:.0f}% = {max_allowed_cb_skips}). Last error: {exc}"
+                    ) from exc
         if generated_cb > 0:
             elapsed_cb = max(time.perf_counter() - t_cb, 1e-6)
             cps = generated_cb / elapsed_cb
-            print(f"[throughput] Chatterbox: {generated_cb} clips in {elapsed_cb:.1f}s ({cps:.2f} clips/sec)", flush=True)
+            print(
+                f"[throughput] Chatterbox: {generated_cb} clips in {elapsed_cb:.1f}s "
+                f"({cps:.2f} clips/sec, skipped={skipped_cb})",
+                flush=True,
+            )
             if cps < 0.5:
                 print("[warn] Chatterbox throughput < 0.5 clips/sec — host GPU may be throttled.", flush=True)
         if cb_model is not None:
@@ -660,6 +687,8 @@ def build_from_hf_on_gpu(
 
         t_k = time.perf_counter()
         generated_k = 0
+        skipped_k = 0
+        max_allowed_k_skips = int(max_kokoro * MAX_SKIP_RATIO)
         for i in tqdm(range(max_kokoro)):
             prompt = kokoro_sentences[i]
             voice = kokoro_voices[i % len(kokoro_voices)]
@@ -674,6 +703,12 @@ def build_from_hf_on_gpu(
                     generated_k += 1
                 dur = _wav_duration_s(out_path)
                 if dur < min_duration_s:
+                    skipped_k += 1
+                    if skipped_k > max_allowed_k_skips:
+                        raise RuntimeError(
+                            f"Kokoro skipped {skipped_k}/{max_kokoro} clips "
+                            f"(>{MAX_SKIP_RATIO * 100:.0f}% threshold; last reason: duration {dur}s < {min_duration_s}s)."
+                        )
                     continue
                 records.append({
                     "id": f"kokoro_{i}",
@@ -687,11 +722,18 @@ def build_from_hf_on_gpu(
                     "duration_s": dur,
                 })
             except Exception as exc:
-                print(f"[warn] Kokoro clip {i} skipped: {exc}", flush=True)
+                skipped_k += 1
+                print(f"[warn] Kokoro clip {i} skipped ({skipped_k}/{max_allowed_k_skips} allowed): {exc}", flush=True)
+                if skipped_k > max_allowed_k_skips:
+                    raise RuntimeError(
+                        f"Kokoro failure threshold exceeded: {skipped_k}/{max_kokoro} clips skipped "
+                        f"(limit {MAX_SKIP_RATIO * 100:.0f}% = {max_allowed_k_skips}). Last error: {exc}"
+                    ) from exc
         if generated_k > 0:
             elapsed_k = max(time.perf_counter() - t_k, 1e-6)
             print(
-                f"[throughput] Kokoro-82M: {generated_k} clips in {elapsed_k:.1f}s ({generated_k / elapsed_k:.2f} clips/sec)",
+                f"[throughput] Kokoro-82M: {generated_k} clips in {elapsed_k:.1f}s "
+                f"({generated_k / elapsed_k:.2f} clips/sec, skipped={skipped_k})",
                 flush=True,
             )
 

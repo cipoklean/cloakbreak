@@ -89,6 +89,7 @@ def train_model(
     precompute_opus: bool = True,
     opus_cache_dir: Path | None = None,
     num_workers: int | None = None,
+    max_steps: int | None = None,
     device_str: str = "cuda",
 ) -> Dict:
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -166,19 +167,24 @@ def train_model(
     best_eer = 101.0
     best_ckpt = out_dir / "cloakbreak_best.pt"
     history = []
+    global_steps = 0
 
     def run_stage(epochs: int, lr: float, stage_name: str) -> None:
-        nonlocal best_eer
+        nonlocal best_eer, global_steps
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=1e-2)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
 
         for ep in range(1, epochs + 1):
+            if max_steps is not None and global_steps >= max_steps:
+                break
             model.train()
             losses = []
             t_ep = time.perf_counter()
             steps = 0
             for x, y in train_loader:
+                if max_steps is not None and global_steps >= max_steps:
+                    break
                 x = x.to(device, non_blocking=device.type == "cuda")
                 y = y.to(device, non_blocking=device.type == "cuda")
                 optimizer.zero_grad(set_to_none=True)
@@ -192,6 +198,9 @@ def train_model(
                 scaler.update()
                 losses.append(float(loss.item()))
                 steps += 1
+                global_steps += 1
+            if steps == 0:
+                break
             scheduler.step()
             ep_sec = max(time.perf_counter() - t_ep, 1e-6)
             steps_per_sec = steps / ep_sec
@@ -212,6 +221,8 @@ def train_model(
             entry = {
                 "stage": stage_name,
                 "epoch": ep,
+                "steps": steps,
+                "global_steps": global_steps,
                 "train_loss": round(float(np.mean(losses)), 4),
                 "steps_per_sec": round(steps_per_sec, 2),
                 "epoch_sec": round(ep_sec, 1),
@@ -222,7 +233,7 @@ def train_model(
             print(json.dumps(entry), flush=True)
 
             eer_val = metrics["eer_pct"]
-            if np.isnan(eer_val) or eer_val <= best_eer:
+            if not best_ckpt.exists() or np.isnan(eer_val) or eer_val <= best_eer:
                 best_eer = eer_val if not np.isnan(eer_val) else best_eer
                 torch.save(
                     {"backbone_id": model.backbone_id, "state_dict": model.state_dict(), "val_metrics": metrics},
@@ -264,6 +275,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--unfreeze-layers", type=int, default=6)
     parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--tiny-test", action="store_true")
     parser.add_argument("--no-precompute-opus", action="store_true")
@@ -280,6 +292,7 @@ def main() -> None:
         use_tiny_test_backbone=args.tiny_test,
         precompute_opus=not args.no_precompute_opus,
         num_workers=args.num_workers,
+        max_steps=args.max_steps,
         device_str=args.device,
     )
 

@@ -9,6 +9,8 @@ kokoro==0.9.4
 misaki[en]==0.9.4
 transformers==5.2.0
 datasets==5.2.0
+pyarrow==25.0.0
+pandas==3.0.6
 accelerate==1.16.0
 huggingface-hub==1.33.0
 safetensors==0.5.3
@@ -22,6 +24,7 @@ spacy==3.8.18
 numpy==1.26.4
 scipy==1.17.1
 soundfile==0.14.0
+scikit-learn==1.9.1
 onnx==1.23.2
 onnxruntime==1.32.0
 fastapi==0.163.2

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -419,12 +422,109 @@ def test_fastapi_private_clone_auth_and_onnx_backend(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setenv("CLOAKBREAK_BACKEND", "mock")
     mock_client = TestClient(create_app(AppState()))
-    r_ok = mock_client.post(
+    # Short 2.5s reference must be rejected (< 5.5s for Chatterbox-Turbo)
+    r_short = mock_client.post(
         "/api/clone",
         files={"reference_wav": ("ref.wav", wav_bytes, "audio/wav")},
+        data={"text": "Owner self test", "condition": "phone_8k"},
+        headers={"Authorization": "Bearer secret-owner-token"},
+    )
+    assert r_short.status_code == 400
+
+    # Valid 6.0s reference succeeds
+    ref6_bytes = wav_to_bytes(_make_dummy_speech(6.0), TARGET_SR)
+    r_ok = mock_client.post(
+        "/api/clone",
+        files={"reference_wav": ("ref6.wav", ref6_bytes, "audio/wav")},
         data={"text": "Owner self test", "condition": "phone_8k"},
         headers={"Authorization": "Bearer secret-owner-token"},
     )
     assert r_ok.status_code == 200
     assert r_ok.headers["content-type"] == "audio/wav"
     assert len(r_ok.content) > 1000
+
+
+def test_cpu_smoke_pipeline_mirrors_vast_smoke(tmp_path: Path) -> None:
+    """Runs the exact Step 2b smoke pipeline on CPU with synthetic audio (40/20/6/4, 20 steps, ONNX eval)."""
+    wild_dir = tmp_path / "wild_40"
+    clean_dir = tmp_path / "clean_20"
+    wild_dir.mkdir(parents=True)
+    clean_dir.mkdir(parents=True)
+    for i in range(40):
+        # Mix 6s refs matching Chatterbox-Turbo > 5.0s requirement
+        dur = 6.0 if i % 2 == 0 else 3.0
+        save_wav_mono(wild_dir / f"wspk{i:02d}_utt0.wav", _make_dummy_speech(dur, freq_hz=150 + i * 3, seed=i), TARGET_SR)
+    for i in range(20):
+        dur = 6.0 if i % 2 == 0 else 3.0
+        save_wav_mono(clean_dir / f"cspk{i:02d}_utt0.wav", _make_dummy_speech(dur, freq_hz=160 + i * 4, seed=500 + i), TARGET_SR)
+
+    data_dir = tmp_path / "smoke_v1"
+    manifest = build_from_local_dir(
+        real_dir=wild_dir,
+        clean_real_dir=clean_dir,
+        out_dir=data_dir,
+        max_chatterbox=6,
+        max_kokoro=4,
+        mock_generator=True,
+    )
+    audit = run_shortcut_audit(manifest, max_per_split=100)
+    assert audit["disjoint_text_check"] == "PASSED"
+
+    ckpt_dir = tmp_path / "smoke_ckpt"
+    summary = train_model(
+        manifest_path=manifest,
+        out_dir=ckpt_dir,
+        epochs_stage1=1,
+        epochs_stage2=2,
+        batch_size=4,
+        max_steps=20,
+        use_tiny_test_backbone=True,
+        precompute_opus=False,
+        num_workers=0,
+        device_str="cpu",
+    )
+    assert summary["history"][-1]["global_steps"] == 20
+    assert Path(summary["fp32_onnx"]).exists()
+    assert Path(summary["int8_onnx"]).exists()
+
+    eval_out = tmp_path / "smoke_results.json"
+    onnx_rt = OnnxDetectorRuntime(summary["int8_onnx"])
+    res = run_evaluation(manifest, detector=onnx_rt, max_per_slice=20, out_json=eval_out)
+    assert eval_out.exists()
+    assert "clean_real_vs_kokoro_clean" in res
+    assert "clean_real_fpr" in res
+
+
+def test_eval_cli_fail_on_shortcut_flag(tmp_path: Path) -> None:
+    biased_dir = tmp_path / "biased_cli"
+    rows = []
+    for split in ("train", "test"):
+        for i in range(8):
+            r_wav = _make_dummy_speech(4.0, freq_hz=190 + i * 4, seed=i) * 0.9
+            f_wav = _make_dummy_speech(1.2, freq_hz=190 + i * 4, seed=100 + i) * 0.08
+            rp = biased_dir / f"{split}_r_{i}.wav"
+            fp = biased_dir / f"{split}_f_{i}.wav"
+            save_wav_mono(rp, r_wav, TARGET_SR)
+            save_wav_mono(fp, f_wav, TARGET_SR)
+            rows.append({"path": str(rp.relative_to(biased_dir)), "label": 0, "generator": "bonafide_wild", "split": split})
+            rows.append({"path": str(fp.relative_to(biased_dir)), "label": 1, "generator": "spoof", "split": split})
+    manifest = biased_dir / "manifest.jsonl"
+    manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+    env_strict = {k: v for k, v in os.environ.items() if k != "ALLOW_SHORTCUT_WARNING"}
+    p_fail = subprocess.run(
+        [sys.executable, "-m", "src.eval", "--shortcut-only", "--fail-on-shortcut", "--manifest", str(manifest)],
+        env=env_strict,
+        capture_output=True,
+        text=True,
+    )
+    assert p_fail.returncode == 2
+
+    env_allow = {**env_strict, "ALLOW_SHORTCUT_WARNING": "1"}
+    p_ok = subprocess.run(
+        [sys.executable, "-m", "src.eval", "--shortcut-only", "--fail-on-shortcut", "--manifest", str(manifest)],
+        env=env_allow,
+        capture_output=True,
+        text=True,
+    )
+    assert p_ok.returncode == 0

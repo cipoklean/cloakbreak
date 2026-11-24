@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -401,13 +403,29 @@ def main() -> None:
     parser.add_argument("--max-per-slice", type=int, default=600)
     parser.add_argument("--out-json", type=Path, default=Path("eval/results.json"))
     parser.add_argument("--shortcut-only", action="store_true", help="Run only acoustic shortcut audit & disjoint check")
+    parser.add_argument(
+        "--fail-on-shortcut",
+        action="store_true",
+        help="Exit non-zero when shortcut_warning is true unless ALLOW_SHORTCUT_WARNING=1",
+    )
     args = parser.parse_args()
+
+    allow_shortcut = os.getenv("ALLOW_SHORTCUT_WARNING", "0").strip().lower() in {"1", "true", "yes"}
+
+    def _has_shortcut_warning(audit: Dict) -> bool:
+        if audit.get("model_window_shortcuts", {}).get("shortcut_warning"):
+            return True
+        if audit.get("clean_real_vs_kokoro_shortcuts", {}).get("shortcut_warning"):
+            return True
+        return False
 
     if args.shortcut_only:
         audit = run_shortcut_audit(args.manifest, max_per_split=args.max_per_slice)
         print(json.dumps(audit, indent=2))
-        if audit["model_window_shortcuts"]["shortcut_warning"]:
+        if _has_shortcut_warning(audit):
             print("[SHORTCUT WARNING] Trivial acoustic classifier exceeded chance on model input windows!")
+            if args.fail_on_shortcut and not allow_shortcut:
+                sys.exit(2)
         return
 
     if args.backend == "mock":
