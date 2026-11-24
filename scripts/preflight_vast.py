@@ -13,6 +13,7 @@ import numpy as np
 from src.audio_utils import TARGET_SR, save_wav_mono
 
 REQUIRED_IMPORTS = [
+    "pkg_resources",
     "numpy",
     "scipy",
     "soundfile",
@@ -27,6 +28,9 @@ REQUIRED_IMPORTS = [
     "huggingface_hub",
     "safetensors",
     "diffusers",
+    "perth",
+    "s3tokenizer",
+    "conformer",
     "chatterbox",
     "chatterbox.tts_turbo",
     "kokoro",
@@ -54,6 +58,54 @@ def _step(name: str) -> None:
     print(f"\n[preflight] {name}...", flush=True)
 
 
+def run_hidden_backend_checks() -> None:
+    """Detect libraries that silently degrade to None behind try/except ImportError."""
+    failures: list[str] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        if ok:
+            print(f"  OK  {label}", flush=True)
+        else:
+            msg = f"{label}: {detail or 'failed / None'}"
+            print(f"  ERR {msg}", flush=True)
+            failures.append(msg)
+
+    import chatterbox.tts_turbo
+    import datasets
+    import diffusers.utils
+    import kokoro
+    import onnxruntime
+    import onnxruntime.quantization
+    import perth
+    import transformers
+    import transformers.utils
+
+    check(
+        "perth.PerthImplicitWatermarker callable",
+        perth.PerthImplicitWatermarker is not None and callable(perth.PerthImplicitWatermarker),
+        "None (likely missing pkg_resources from setuptools>=81; pin setuptools==80.9.0)",
+    )
+    check(
+        "chatterbox.tts_turbo.ChatterboxTurboTTS",
+        getattr(chatterbox.tts_turbo, "ChatterboxTurboTTS", None) is not None,
+    )
+    check("kokoro.KPipeline", getattr(kokoro, "KPipeline", None) is not None)
+    check("transformers torch backend", bool(transformers.utils.is_torch_available()))
+    check("transformers safetensors backend", bool(transformers.utils.is_safetensors_available()))
+    for sym in ("AutoModel", "AutoModelForAudioClassification", "AutoFeatureExtractor", "WavLMModel", "Wav2Vec2ForSequenceClassification"):
+        check(f"transformers.{sym}", getattr(transformers, sym, None) is not None)
+    check("diffusers torch backend", bool(diffusers.utils.is_torch_available()))
+    check("diffusers safetensors backend", bool(diffusers.utils.is_safetensors_available()))
+    check("datasets.Audio & load_dataset", datasets.Audio is not None and datasets.load_dataset is not None)
+    check(
+        "onnxruntime InferenceSession & quantize_dynamic",
+        onnxruntime.InferenceSession is not None and onnxruntime.quantization.quantize_dynamic is not None,
+    )
+
+    if failures:
+        sys.exit("PREFLIGHT FAIL (silent optional-backend check):\n  " + "\n  ".join(failures))
+
+
 def run_import_sweep() -> None:
     failures: list[str] = []
     for mod_name in REQUIRED_IMPORTS:
@@ -67,6 +119,7 @@ def run_import_sweep() -> None:
             failures.append(f"{mod_name}: {exc}")
     if failures:
         sys.exit("PREFLIGHT FAIL (import sweep):\n  " + "\n  ".join(failures))
+    run_hidden_backend_checks()
 
 
 def main() -> None:
