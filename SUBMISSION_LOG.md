@@ -28,6 +28,7 @@ idle storage charges).
 | 2026 voice cloner (train/demo) | `ResembleAI/chatterbox` (Turbo 350M / 500M) | No | MIT | `SWivid/F5-TTS` (`CC-BY-NC-4.0`, non-commercial — disclose in README if used) |
 | Unseen held-out TTS | `hexgrad/Kokoro-82M` | No | Apache-2.0 | `facebook/mms-tts-eng` (`CC-BY-NC-4.0`, non-commercial — disclose in README if used) |
 | Real/In-The-Wild dataset | `SpeechAntiSpoofingBenchmarks/InTheWild` | No | Apache-2.0 | `mueller91/In-The-Wild` (CC-BY-SA-4.0) |
+| Clean bonafide read speech | `openslr/librispeech_asr` (`clean`, streaming Parquet) | No | CC-BY-4.0 | `google/fleurs` (`en_us`, CC-BY-4.0) |
 | Diverse English sentence pool | `agentlans/high-quality-english-sentences` | No | ODC-BY | `databricks/databricks-dolly-15k` (CC-BY-SA-3.0) |
 | Optional neural-codec dataset | `abdulahh35/ANC-Spoof` *(cut first if tight)* | No | CC-BY-4.0 | On-the-fly Opus/8kHz augmentation |
 

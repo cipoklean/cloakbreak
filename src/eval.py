@@ -8,7 +8,15 @@ from typing import Dict, List, Sequence
 import numpy as np
 from scipy.optimize import minimize
 
-from src.audio_utils import TARGET_SR, audio_rms, load_wav_mono, normalize_loudness, pad_or_crop
+from src.audio_utils import (
+    TARGET_SR,
+    audio_rms,
+    estimate_snr_db,
+    load_wav_mono,
+    normalize_loudness,
+    pad_or_crop,
+    spectral_rolloff_hz,
+)
 from src.augment import EvalCondition, degrade_for_eval
 from src.generate_spoofs import assert_disjoint_text_splits
 from src.model import (
@@ -20,6 +28,8 @@ from src.model import (
     OnnxDetectorRuntime,
     TorchDetectorRuntime,
 )
+
+SHORTCUT_FEATURE_NAMES = ["duration_s", "rms", "est_snr_db", "rolloff_85_hz"]
 
 
 def compute_eer_and_auroc(labels: Sequence[int], scores: Sequence[float]) -> Dict[str, float]:
@@ -48,14 +58,12 @@ def compute_eer_and_auroc(labels: Sequence[int], scores: Sequence[float]) -> Dic
     fpr_curve = np.concatenate([[0.0], fpr])
     auroc = float(np.trapezoid(tpr_curve, fpr_curve))
 
-    # Interpolate EER cleanly along ROC segments
     fnr_curve = 1.0 - tpr_curve
     diff = fpr_curve - fnr_curve
     idx = int(np.argmin(np.abs(diff)))
     if diff[idx] == 0.0:
         eer = float(fpr_curve[idx])
     else:
-        # Find sign change crossing between adjacent curve points
         cross = np.where(np.sign(diff[:-1]) != np.sign(diff[1:]))[0]
         if cross.size > 0:
             i0 = int(cross[0])
@@ -80,18 +88,13 @@ def compute_eer_and_auroc(labels: Sequence[int], scores: Sequence[float]) -> Dic
     }
 
 
-def _fit_eval_logistic(x_train: np.ndarray, y_train: np.ndarray, x_test: np.ndarray, y_test: np.ndarray) -> Dict[str, float]:
+def _fit_logistic_weights(x_train: np.ndarray, y_train: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     mu = x_train.mean(axis=0)
     sigma = x_train.std(axis=0)
-    # Ignore sub-PCM-floor floating-point rounding dust (< 1e-4)
     constant_cols = sigma < 1e-4
     sigma_safe = np.where(constant_cols, 1.0, sigma)
     xtr = np.where(constant_cols, 0.0, (x_train - mu) / sigma_safe)
-    xte = np.where(constant_cols, 0.0, (x_test - mu) / sigma_safe)
-
-    # Add bias column
     xtr_b = np.hstack([xtr, np.ones((xtr.shape[0], 1))])
-    xte_b = np.hstack([xte, np.ones((xte.shape[0], 1))])
 
     def loss_and_grad(w: np.ndarray) -> tuple[float, np.ndarray]:
         z = np.clip(xtr_b @ w, -30.0, 30.0)
@@ -103,7 +106,19 @@ def _fit_eval_logistic(x_train: np.ndarray, y_train: np.ndarray, x_test: np.ndar
         return loss, grad
 
     res = minimize(loss_and_grad, np.zeros(xtr_b.shape[1]), jac=True, method="BFGS")
-    w = res.x
+    return res.x, mu, sigma_safe, constant_cols
+
+
+def _score_logistic(
+    w: np.ndarray,
+    mu: np.ndarray,
+    sigma_safe: np.ndarray,
+    constant_cols: np.ndarray,
+    x_test: np.ndarray,
+    y_test: np.ndarray,
+) -> Dict[str, float]:
+    xte = np.where(constant_cols, 0.0, (x_test - mu) / sigma_safe)
+    xte_b = np.hstack([xte, np.ones((xte.shape[0], 1))])
     probs = 1.0 / (1.0 + np.exp(-np.clip(xte_b @ w, -30.0, 30.0)))
     return compute_eer_and_auroc(y_test.astype(np.int32).tolist(), probs.tolist())
 
@@ -122,12 +137,33 @@ def _resolve_manifest_rows(manifest_path: Path) -> List[Dict]:
     return out
 
 
-def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
-    """Audit dataset for trivial duration/RMS shortcuts before trusting neural metrics.
+def _is_shortcut(m: Dict[str, float]) -> bool:
+    auc = m["auroc"]
+    eer = m["eer_pct"]
+    if np.isnan(auc) or np.isnan(eer):
+        return False
+    return (auc >= 0.60) or (eer <= 40.0)
 
-    Fits an L2 logistic classifier using ONLY [duration_s, rms] on:
-      1. Raw WAV files on disk (catches unnormalized duration/level gaps).
+
+def _feature_means(feats: np.ndarray, labels: np.ndarray) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for cls_name, cls_val in (("real", 0), ("spoof", 1)):
+        sub = feats[labels == cls_val]
+        if sub.size == 0:
+            continue
+        out[cls_name] = {
+            name: round(float(sub[:, i].mean()), 4) for i, name in enumerate(SHORTCUT_FEATURE_NAMES)
+        }
+    return out
+
+
+def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
+    """Audit dataset for trivial acoustic/channel shortcuts before trusting neural metrics.
+
+    Fits an L2 logistic classifier using ONLY [duration_s, rms, est_snr_db, rolloff_85_hz] on:
+      1. Raw WAV files on disk.
       2. Model-input 2.5s normalized windows (what the neural network actually sees).
+      3. Clean bonafide vs unseen Kokoro test windows (if both exist in test).
     Flags shortcut_warning=True if test AUROC >= 0.60 or EER <= 40%.
     """
     rows = _resolve_manifest_rows(manifest_path)
@@ -139,40 +175,74 @@ def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
         mid = max(2, len(rows) // 2)
         train_rows, test_rows = rows[:mid], rows[mid:]
 
+    win_sec = DEFAULT_WINDOW_SAMPLES / float(TARGET_SR)
+
     def extract(subset: List[Dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         raw_feats, win_feats, labels = [], [], []
         for r in subset:
             wav, sr = load_wav_mono(r["path"], target_sr=TARGET_SR)
             raw_dur = wav.shape[0] / float(sr)
-            raw_rms = audio_rms(wav)
-            raw_feats.append([raw_dur, raw_rms])
+            raw_feats.append([
+                raw_dur,
+                audio_rms(wav),
+                estimate_snr_db(wav, sr),
+                spectral_rolloff_hz(wav, sr),
+            ])
 
             win = normalize_loudness(pad_or_crop(wav, DEFAULT_WINDOW_SAMPLES, random_crop=False))
-            eff_dur = min(raw_dur, DEFAULT_WINDOW_SAMPLES / float(TARGET_SR))
-            win_feats.append([eff_dur, audio_rms(win)])
+            eff_dur = min(raw_dur, win_sec)
+            win_feats.append([
+                eff_dur,
+                audio_rms(win),
+                estimate_snr_db(win, TARGET_SR),
+                spectral_rolloff_hz(win, TARGET_SR),
+            ])
             labels.append(int(r["label"]))
-        return np.asarray(raw_feats, dtype=np.float64), np.asarray(win_feats, dtype=np.float64), np.asarray(labels, dtype=np.float64)
+        return (
+            np.asarray(raw_feats, dtype=np.float64),
+            np.asarray(win_feats, dtype=np.float64),
+            np.asarray(labels, dtype=np.float64),
+        )
 
     tr_raw, tr_win, y_tr = extract(train_rows)
     te_raw, te_win, y_te = extract(test_rows)
 
-    raw_metrics = _fit_eval_logistic(tr_raw, y_tr, te_raw, y_te)
-    win_metrics = _fit_eval_logistic(tr_win, y_tr, te_win, y_te)
+    w_raw, mu_r, sig_r, const_r = _fit_logistic_weights(tr_raw, y_tr)
+    raw_metrics = _score_logistic(w_raw, mu_r, sig_r, const_r, te_raw, y_te)
 
-    def _is_shortcut(m: Dict[str, float]) -> bool:
-        auc = m["auroc"]
-        eer = m["eer_pct"]
-        if np.isnan(auc) or np.isnan(eer):
-            return False
-        return (auc >= 0.60) or (eer <= 40.0)
+    w_win, mu_w, sig_w, const_w = _fit_logistic_weights(tr_win, y_tr)
+    win_metrics = _score_logistic(w_win, mu_w, sig_w, const_w, te_win, y_te)
 
-    return {
+    audit: Dict = {
         "disjoint_text_check": "PASSED",
+        "features": SHORTCUT_FEATURE_NAMES,
         "num_train": len(train_rows),
         "num_test": len(test_rows),
-        "raw_duration_rms": {**raw_metrics, "shortcut_warning": _is_shortcut(raw_metrics)},
-        "model_window_rms": {**win_metrics, "shortcut_warning": _is_shortcut(win_metrics)},
+        "raw_acoustic_shortcuts": {
+            **raw_metrics,
+            "shortcut_warning": _is_shortcut(raw_metrics),
+            "test_feature_means": _feature_means(te_raw, y_te),
+        },
+        "model_window_shortcuts": {
+            **win_metrics,
+            "shortcut_warning": _is_shortcut(win_metrics),
+            "test_feature_means": _feature_means(te_win, y_te),
+        },
     }
+
+    clean_real_test = [r for r in test_rows if r.get("generator") == "bonafide_clean"]
+    kokoro_test = [r for r in test_rows if "kokoro" in str(r.get("generator", ""))]
+    if clean_real_test and kokoro_test:
+        pair = clean_real_test[: min(len(clean_real_test), len(kokoro_test))] + kokoro_test[: min(len(clean_real_test), len(kokoro_test))]
+        _, ck_win, y_ck = extract(pair)
+        ck_metrics = _score_logistic(w_win, mu_w, sig_w, const_w, ck_win, y_ck)
+        audit["clean_real_vs_kokoro_shortcuts"] = {
+            **ck_metrics,
+            "shortcut_warning": _is_shortcut(ck_metrics),
+            "test_feature_means": _feature_means(ck_win, y_ck),
+        }
+
+    return audit
 
 
 def evaluate_slice(
@@ -210,13 +280,44 @@ def evaluate_slice(
     return out
 
 
+def evaluate_clean_real_fpr(
+    clean_real_rows: List[Dict],
+    detector: DetectorRuntime,
+    baseline: BaselineDetectorRuntime | None = None,
+    condition: EvalCondition = "clean",
+) -> Dict:
+    """Measure false-positive rate on clean human speech alone (predicts live laptop-mic FP risk)."""
+    cb_scores: List[float] = []
+    base_scores: List[float] = []
+    for i, row in enumerate(clean_real_rows):
+        wav, sr = load_wav_mono(row["path"], target_sr=TARGET_SR)
+        degraded = degrade_for_eval(wav, condition=condition, sr=sr, seed=2000 + i)
+        cb_scores.append(detector.predict(degraded).spoof_prob)
+        if baseline is not None:
+            base_scores.append(baseline.predict_prob(degraded))
+
+    arr = np.asarray(cb_scores, dtype=np.float64)
+    out: Dict = {
+        "condition": condition,
+        "num_clean_real": len(cb_scores),
+        "cloakbreak_fpr_at_05_pct": round(float(np.mean(arr >= 0.5) * 100.0), 2) if arr.size else float("nan"),
+        "cloakbreak_mean_prob": round(float(arr.mean()), 4) if arr.size else float("nan"),
+        "cloakbreak_p95_prob": round(float(np.percentile(arr, 95)), 4) if arr.size else float("nan"),
+    }
+    if baseline is not None and base_scores:
+        barr = np.asarray(base_scores, dtype=np.float64)
+        out["baseline_fpr_at_05_pct"] = round(float(np.mean(barr >= 0.5) * 100.0), 2)
+        out["baseline_mean_prob"] = round(float(barr.mean()), 4)
+    return out
+
+
 def format_markdown_table(results: Dict[str, Dict]) -> str:
     lines = [
         "| Eval Slice | Clips (Real/Spoof) | Baseline EER (%) | CloakBreak EER (%) | CloakBreak AUROC | p50 / p95 Latency (ms) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: |",
     ]
     for name, r in results.items():
-        if name == "shortcut_audit":
+        if name in {"shortcut_audit", "clean_real_fpr"}:
             continue
         base_eer = f"{r['baseline']['eer_pct']:.2f}" if "baseline" in r else "N/A"
         cb_eer = f"{r['cloakbreak']['eer_pct']:.2f}"
@@ -224,6 +325,16 @@ def format_markdown_table(results: Dict[str, Dict]) -> str:
         lat = f"{r['latency_p50_ms']:.1f} / {r['latency_p95_ms']:.1f}"
         counts = f"{r['num_clips']} ({r['num_real']}/{r['num_spoof']})"
         lines.append(f"| {name} | {counts} | {base_eer} | {cb_eer} | {cb_auc} | {lat} |")
+
+    if "clean_real_fpr" in results:
+        fpr = results["clean_real_fpr"]
+        base_str = f" | Baseline FPR@0.5: {fpr['baseline_fpr_at_05_pct']:.2f}%" if "baseline_fpr_at_05_pct" in fpr else ""
+        lines.append("")
+        lines.append(
+            f"Clean human speech FPR@0.5 ({fpr['num_clean_real']} clips): "
+            f"CloakBreak = {fpr['cloakbreak_fpr_at_05_pct']:.2f}% "
+            f"(mean prob {fpr['cloakbreak_mean_prob']:.4f}, p95 {fpr['cloakbreak_p95_prob']:.4f}){base_str}"
+        )
     return "\n".join(lines)
 
 
@@ -240,8 +351,9 @@ def run_evaluation(
         test_rows = rows
 
     real_test = [r for r in test_rows if int(r["label"]) == 0]
-    itw_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" not in r.get("generator", "")]
-    kokoro_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" in r.get("generator", "")]
+    clean_real_test = [r for r in real_test if r.get("generator") == "bonafide_clean"]
+    main_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" not in str(r.get("generator", ""))]
+    kokoro_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" in str(r.get("generator", ""))]
 
     def balanced_pair(reals: List[Dict], spoofs: List[Dict]) -> List[Dict]:
         n = min(len(reals), len(spoofs), max_per_slice // 2)
@@ -249,17 +361,29 @@ def run_evaluation(
             return (reals + spoofs)[:max_per_slice]
         return reals[:n] + spoofs[:n]
 
-    main_pair = balanced_pair(real_test, itw_spoof)
-    kokoro_pair = balanced_pair(real_test, kokoro_spoof) if kokoro_spoof else []
+    main_pair = balanced_pair(real_test, main_spoof)
+    kokoro_all_pair = balanced_pair(real_test, kokoro_spoof) if kokoro_spoof else []
+    clean_vs_kokoro_pair = balanced_pair(clean_real_test, kokoro_spoof) if (clean_real_test and kokoro_spoof) else []
 
     slices: Dict[str, Dict] = {
         "shortcut_audit": run_shortcut_audit(manifest_path, max_per_split=max_per_slice),
     }
     for cond in ("clean", "opus_16k", "phone_8k", "noise_5db", "short_0.5s", "short_0.8s"):
         slices[f"test_{cond}"] = evaluate_slice(main_pair, detector, condition=cond, baseline=baseline)
-    if kokoro_pair:
-        slices["unseen_kokoro_clean"] = evaluate_slice(kokoro_pair, detector, condition="clean", baseline=baseline)
-        slices["unseen_kokoro_opus_16k"] = evaluate_slice(kokoro_pair, detector, condition="opus_16k", baseline=baseline)
+    if kokoro_all_pair:
+        slices["unseen_kokoro_clean"] = evaluate_slice(kokoro_all_pair, detector, condition="clean", baseline=baseline)
+        slices["unseen_kokoro_opus_16k"] = evaluate_slice(kokoro_all_pair, detector, condition="opus_16k", baseline=baseline)
+    if clean_vs_kokoro_pair:
+        slices["clean_real_vs_kokoro_clean"] = evaluate_slice(
+            clean_vs_kokoro_pair, detector, condition="clean", baseline=baseline
+        )
+        slices["clean_real_vs_kokoro_opus_16k"] = evaluate_slice(
+            clean_vs_kokoro_pair, detector, condition="opus_16k", baseline=baseline
+        )
+    if clean_real_test:
+        slices["clean_real_fpr"] = evaluate_clean_real_fpr(
+            clean_real_test[:max_per_slice], detector, baseline=baseline, condition="clean"
+        )
 
     if out_json is not None:
         out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -276,14 +400,14 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max-per-slice", type=int, default=600)
     parser.add_argument("--out-json", type=Path, default=Path("eval/results.json"))
-    parser.add_argument("--shortcut-only", action="store_true", help="Run only duration+RMS shortcut audit & disjoint check")
+    parser.add_argument("--shortcut-only", action="store_true", help="Run only acoustic shortcut audit & disjoint check")
     args = parser.parse_args()
 
     if args.shortcut_only:
         audit = run_shortcut_audit(args.manifest, max_per_split=args.max_per_slice)
         print(json.dumps(audit, indent=2))
-        if audit["model_window_rms"]["shortcut_warning"]:
-            print("[SHORTCUT WARNING] Trivial duration+RMS classifier exceeded chance on model input windows!")
+        if audit["model_window_shortcuts"]["shortcut_warning"]:
+            print("[SHORTCUT WARNING] Trivial acoustic classifier exceeded chance on model input windows!")
         return
 
     if args.backend == "mock":
@@ -305,7 +429,7 @@ def main() -> None:
         max_per_slice=args.max_per_slice,
         out_json=args.out_json,
     )
-    print("=== Shortcut Audit (Duration + RMS Logistic Classifier) ===")
+    print("=== Shortcut Audit (Duration + RMS + SNR + Spectral Rolloff) ===")
     print(json.dumps(results["shortcut_audit"], indent=2))
     print("\n=== Benchmark Table ===")
     print(format_markdown_table(results))

@@ -10,13 +10,14 @@ set -euo pipefail
 # Recommended hardware:
 #   1x RTX 3090 (24 GB VRAM), On-Demand <= $0.25/hr, >= 6 vCPUs, >= 50 GB disk, >= 1000 Mbps down
 #
-# Expected RTX 3090 throughput & Session 1 estimate (~0.75-1.25 hrs, ~$0.18-$0.35):
-#   - InTheWild download + normalize (12k clips):  ~3-6 min
+# Expected RTX 3090 throughput & Session 1 estimate (~0.7-1.2 hrs, ~$0.18-$0.30):
+#   - Shuffled InTheWild (12k clips, seed=42):     ~3-6 min
+#   - LibriSpeech clean stream (3.7k bonafide):    ~2-3 min (CC-BY-4.0, speaker-disjoint)
 #   - Chatterbox-Turbo (3,000 unwatermarked clips): ~1.5-3.0 clips/sec (~17-35 min; warn < 0.5 clips/sec)
 #   - Kokoro-82M (600 disjoint held-out clips):    ~10-20 clips/sec (~1 min)
-#   - Shortcut audit (duration + RMS check):       ~15 sec
-#   - Opus 16k parallel CPU cache (6-12 vCPUs):    ~1-2 min (~150-300 clips/sec)
-#   - WavLM Stage-1 1-epoch smoke test (bs=24):    ~4-8 steps/sec (~1-2 min)
+#   - Shortcut audit (dur/RMS/SNR/rolloff check):  ~30 sec
+#   - Opus 16k parallel CPU cache (6-12 vCPUs):    ~1.5-2.5 min (~150-300 clips/sec)
+#   - WavLM Stage-1 1-epoch smoke test (bs=24):    ~4-8 steps/sec (~1.5-2.5 min)
 #   - HF upload (generated clips + manifest only): ~30-60 sec (~350-500 MB)
 #
 # Run INSIDE tmux so SSH drops on mobile data never kill progress:
@@ -89,15 +90,20 @@ fi
 # Step 3: Dataset download + unwatermarked Chatterbox-Turbo + disjoint Kokoro-82M
 # (generate_spoofs.py is clip-level resumable if interrupted mid-step)
 if [ ! -f logs/.s1_dataset_done ]; then
-  echo "[step 3/6] Building CloakBreak v1 dataset (diverse ODC-BY text, unwatermarked clones, loudness normalized)..."
+  echo "[step 3/6] Building CloakBreak v1 dataset (shuffled InTheWild + LibriSpeech clean + unwatermarked Chatterbox + disjoint Kokoro)..."
   python3 -m src.generate_spoofs \
     --source hf \
     --hf-dataset SpeechAntiSpoofingBenchmarks/InTheWild \
+    --clean-real-dataset openslr/librispeech_asr \
     --text-dataset agentlans/high-quality-english-sentences \
     --out-dir data/cloakbreak_v1 \
     --max-real 12000 \
+    --max-clean-train 2600 \
+    --max-clean-val 500 \
+    --max-clean-test 600 \
     --max-chatterbox 3000 \
     --max-kokoro 600 \
+    --seed 42 \
     --use-turbo
   touch logs/.s1_dataset_done
 else

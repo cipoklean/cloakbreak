@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -21,6 +22,8 @@ from src.audio_utils import (
 
 # Open, non-gated English sentence corpus (license: ODC-BY, ~1.53M sentences)
 DEFAULT_TEXT_DATASET = "agentlans/high-quality-english-sentences"
+# Open, non-gated clean read-speech corpus (license: CC-BY-4.0, Parquet streaming)
+DEFAULT_CLEAN_REAL_DATASET = "openslr/librispeech_asr"
 
 # Reserved strictly for the live UI demo — NEVER used in training or evaluation.
 DEMO_PROMPTS = [
@@ -167,6 +170,22 @@ def assert_disjoint_text_splits(records: Sequence[Dict]) -> None:
         )
 
 
+def summarize_manifest_counts(records: Sequence[Dict]) -> Dict[str, Dict]:
+    by_split: Dict[str, Dict] = {}
+    for split in ("train", "val", "test"):
+        sub = [r for r in records if r.get("split") == split]
+        gen_counts = dict(sorted(Counter(str(r.get("generator", "unknown")) for r in sub).items()))
+        n_real = sum(1 for r in sub if int(r["label"]) == 0)
+        n_spoof = sum(1 for r in sub if int(r["label"]) == 1)
+        by_split[split] = {
+            "total": len(sub),
+            "real": n_real,
+            "spoof": n_spoof,
+            "by_generator": gen_counts,
+        }
+    return by_split
+
+
 def assign_speaker_split(speaker_id: str) -> str:
     """Deterministic speaker-disjoint split: ~70% train, 15% val, 15% test."""
     digest = int(hashlib.sha256(speaker_id.encode("utf-8")).hexdigest()[:8], 16) % 100
@@ -191,6 +210,17 @@ def _write_manifest_atomic(manifest_path: Path, records: List[Dict]) -> None:
         for row in records:
             f.write(json.dumps(row) + "\n")
     tmp_path.replace(manifest_path)
+
+
+def _decode_hf_audio_row(audio_info: Dict) -> np.ndarray | None:
+    raw_bytes = audio_info.get("bytes")
+    if raw_bytes is not None:
+        audio_16k, _ = load_wav_bytes_mono(raw_bytes, target_sr=TARGET_SR)
+        return audio_16k
+    if audio_info.get("path"):
+        audio_16k, _ = load_wav_mono(audio_info["path"], target_sr=TARGET_SR)
+        return audio_16k
+    return None
 
 
 def synthesize_mock_clone(ref_audio: np.ndarray, seed: int) -> np.ndarray:
@@ -229,8 +259,9 @@ def build_from_local_dir(
     max_kokoro: int = 10,
     mock_generator: bool = True,
     sentences: Sequence[str] | None = None,
+    clean_real_dir: Path | None = None,
 ) -> Path:
-    """Resumable local builder with loudness normalization and disjoint sentences."""
+    """Resumable local builder with loudness normalization, clean/wild bonafide, and disjoint sentences."""
     out_dir.mkdir(parents=True, exist_ok=True)
     wavs = sorted(real_dir.glob("*.wav"))
     if not wavs:
@@ -254,12 +285,33 @@ def build_from_local_dir(
             "id": f"real_{idx}",
             "path": str(norm_path.relative_to(out_dir)),
             "label": 0,
-            "generator": "bonafide",
+            "generator": "bonafide_wild",
             "watermarked": False,
             "speaker_id": speaker_id,
             "split": split,
             "duration_s": _wav_duration_s(norm_path),
         })
+
+    if clean_real_dir is not None:
+        clean_out = out_dir / "clean_real_norm"
+        clean_out.mkdir(parents=True, exist_ok=True)
+        for idx, wav_path in enumerate(sorted(clean_real_dir.glob("*.wav"))):
+            speaker_id = f"clean_{wav_path.stem.split('_')[0] or idx}"
+            split = assign_speaker_split(speaker_id)
+            norm_path = clean_out / wav_path.name
+            if not norm_path.exists():
+                audio, sr = load_wav_mono(wav_path, target_sr=TARGET_SR)
+                save_wav_mono(norm_path, normalize_loudness(audio), sr)
+            records.append({
+                "id": f"clean_real_{idx}",
+                "path": str(norm_path.relative_to(out_dir)),
+                "label": 0,
+                "generator": "bonafide_clean",
+                "watermarked": False,
+                "speaker_id": speaker_id,
+                "split": split,
+                "duration_s": _wav_duration_s(norm_path),
+            })
 
     cb_dir = out_dir / "chatterbox"
     cb_dir.mkdir(parents=True, exist_ok=True)
@@ -310,37 +362,123 @@ def build_from_local_dir(
     return manifest_path
 
 
+def _stream_librispeech_clean(
+    clean_dir: Path,
+    out_dir: Path,
+    dataset_id: str,
+    split_quotas: Dict[str, Tuple[str, int]],
+    min_duration_s: float,
+    max_duration_s: float,
+    seed: int = 42,
+) -> tuple[List[Dict], List[Dict]]:
+    """Stream clean bonafide read speech from openslr/librispeech_asr (CC-BY-4.0).
+
+    Uses LibriSpeech's official speaker-disjoint splits (train.100, validation, test)
+    via streaming=True so only the requested clips are transferred.
+    """
+    from datasets import Audio, load_dataset
+    from tqdm import tqdm
+
+    clean_records: List[Dict] = []
+    clean_refs: List[Dict] = []
+
+    for target_split, (hf_split, quota) in split_quotas.items():
+        if quota <= 0:
+            continue
+        split_dir = clean_dir / target_split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        ds = load_dataset(dataset_id, "clean", split=hf_split, streaming=True)
+        ds = ds.cast_column("audio", Audio(decode=False))
+        ds = ds.shuffle(seed=seed, buffer_size=1500)
+
+        kept = 0
+        reused = 0
+        print(
+            f"Streaming {quota} clean bonafide clips from {dataset_id} clean/{hf_split} -> split={target_split}...",
+            flush=True,
+        )
+        pbar = tqdm(total=quota)
+        for row in ds:
+            utt_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(row.get("id") or f"ls_{kept}"))
+            speaker_id = f"ls_{row.get('speaker_id', utt_id)}"
+            wav_path = split_dir / f"{utt_id}.wav"
+
+            if wav_path.exists() and wav_path.stat().st_size > 100:
+                dur = _wav_duration_s(wav_path)
+                reused += 1
+            else:
+                audio_16k = _decode_hf_audio_row(row["audio"])
+                if audio_16k is None:
+                    continue
+                dur = audio_16k.shape[0] / float(TARGET_SR)
+                if dur < min_duration_s or dur > max_duration_s:
+                    continue
+                save_wav_mono(wav_path, normalize_loudness(audio_16k), TARGET_SR)
+
+            if dur < min_duration_s or dur > max_duration_s:
+                continue
+
+            rec = {
+                "id": f"ls_{utt_id}",
+                "path": str(wav_path.relative_to(out_dir)),
+                "label": 0,
+                "generator": "bonafide_clean",
+                "watermarked": False,
+                "speaker_id": speaker_id,
+                "split": target_split,
+                "duration_s": round(dur, 3),
+            }
+            clean_records.append(rec)
+            if 3.0 <= dur <= 9.0:
+                clean_refs.append(rec)
+            kept += 1
+            pbar.update(1)
+            if kept >= quota:
+                break
+        pbar.close()
+        print(f"LibriSpeech clean/{hf_split} ready: {kept} clips ({reused} reused from disk).", flush=True)
+    return clean_records, clean_refs
+
+
 def build_from_hf_on_gpu(
     out_dir: Path,
     hf_dataset: str = "SpeechAntiSpoofingBenchmarks/InTheWild",
+    clean_real_dataset: str = DEFAULT_CLEAN_REAL_DATASET,
     text_dataset: str = DEFAULT_TEXT_DATASET,
     max_real: int = 12000,
+    max_clean_train: int = 2600,
+    max_clean_val: int = 500,
+    max_clean_test: int = 600,
     max_chatterbox: int = 3000,
     max_kokoro: int = 600,
     use_turbo: bool = True,
     disable_watermark: bool = True,
     min_duration_s: float = 2.5,
     max_duration_s: float = 10.0,
+    seed: int = 42,
 ) -> Path:
     """Resumable GPU dataset builder with strict anti-shortcut controls.
 
-    1. Diverse open sentences streamed from agentlans/high-quality-english-sentences (ODC-BY).
-    2. Strictly disjoint sentence sets between Chatterbox and held-out Kokoro-82M.
-    3. Chatterbox Perth watermark disabled by default for defensive training data.
-    4. Identical RMS loudness normalization & duration band [2.5s, 10.0s] across real and fake.
-    5. Throughput (clips/sec) logged live to flag underperforming GPU hosts.
+    1. Shuffles InTheWild with a fixed seed BEFORE slicing max_real.
+    2. Streams speaker-disjoint clean bonafide speech from openslr/librispeech_asr (CC-BY-4.0)
+       so the detector cannot learn "clean recording = fake".
+    3. Diverse open sentences streamed from agentlans/high-quality-english-sentences (ODC-BY)
+       with strictly disjoint Chatterbox vs held-out Kokoro-82M pools.
+    4. Chatterbox Perth watermark disabled by default for defensive training data.
+    5. Identical RMS loudness normalization & duration band [2.5s, 10.0s] across all real/fake clips.
+    6. Logs exact per-split & per-generator counts + live throughput (clips/sec).
     """
     from datasets import Audio, load_dataset
     from tqdm import tqdm
 
     out_dir.mkdir(parents=True, exist_ok=True)
     real_dir = out_dir / "inthewild_wav"
+    clean_dir = out_dir / "librispeech_clean"
     cb_dir = out_dir / "chatterbox"
     kokoro_dir = out_dir / "kokoro_unseen"
-    for d in (real_dir, cb_dir, kokoro_dir):
+    for d in (real_dir, clean_dir, cb_dir, kokoro_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # Cache the exact deterministic sentence pools to disk so resumed runs use identical prompts
     prompt_cache = out_dir / "disjoint_prompts.json"
     if prompt_cache.exists():
         cached = json.loads(prompt_cache.read_text(encoding="utf-8"))
@@ -354,38 +492,41 @@ def build_from_hf_on_gpu(
         )
     else:
         print(f"Streaming {max_chatterbox + max_kokoro} unique sentences from {text_dataset} (ODC-BY)...", flush=True)
-        all_sentences = load_diverse_sentences_from_hf(max_chatterbox + max_kokoro, dataset_id=text_dataset, seed=42)
+        all_sentences = load_diverse_sentences_from_hf(max_chatterbox + max_kokoro, dataset_id=text_dataset, seed=seed)
         cb_sentences, kokoro_sentences = split_disjoint_sentence_pools(all_sentences, max_chatterbox, max_kokoro)
         prompt_cache.write_text(
             json.dumps({"source": text_dataset, "chatterbox": cb_sentences, "kokoro": kokoro_sentences}, indent=2),
             encoding="utf-8",
         )
 
+    # 1. Shuffled InTheWild (prevents speaker/label ordering skew)
     ds = load_dataset(hf_dataset, split="train").cast_column("audio", Audio(decode=False))
-    records: List[Dict] = []
-    bonafide_refs: List[Dict] = []
+    ds = ds.shuffle(seed=seed)
 
+    records: List[Dict] = []
+    wild_refs: List[Dict] = []
     skipped_real = 0
-    print(f"Exporting up to {max_real} loudness-normalized InTheWild clips ({min_duration_s}-{max_duration_s}s)...", flush=True)
-    for idx, row in enumerate(tqdm(ds, total=min(len(ds), max_real))):
-        if idx >= max_real:
+    kept_itw = 0
+    print(
+        f"Exporting up to {max_real} shuffled InTheWild clips (seed={seed}, {min_duration_s}-{max_duration_s}s)...",
+        flush=True,
+    )
+    pbar = tqdm(total=min(len(ds), max_real))
+    for idx, row in enumerate(ds):
+        if kept_itw >= max_real:
             break
         notes = json.loads(row["notes"]) if isinstance(row.get("notes"), str) else {}
         speaker_id = str(notes.get("speaker") or f"itw_spk_{idx}")
+        utt_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(notes.get("utterance_id") or f"itw_{idx:06d}"))
         label = int(row["label"])
-        wav_path = real_dir / f"itw_{idx:06d}.wav"
+        wav_path = real_dir / f"{utt_id}.wav"
 
         if wav_path.exists() and wav_path.stat().st_size > 100:
             dur = _wav_duration_s(wav_path)
             skipped_real += 1
         else:
-            audio_info = row["audio"]
-            raw_bytes = audio_info.get("bytes")
-            if raw_bytes is not None:
-                audio_16k, _ = load_wav_bytes_mono(raw_bytes, target_sr=TARGET_SR)
-            elif audio_info.get("path"):
-                audio_16k, _ = load_wav_mono(audio_info["path"], target_sr=TARGET_SR)
-            else:
+            audio_16k = _decode_hf_audio_row(row["audio"])
+            if audio_16k is None:
                 continue
             dur = audio_16k.shape[0] / float(TARGET_SR)
             if dur < min_duration_s or dur > max_duration_s:
@@ -396,10 +537,10 @@ def build_from_hf_on_gpu(
             continue
         split = assign_speaker_split(speaker_id)
         rec = {
-            "id": f"itw_{idx}",
+            "id": utt_id,
             "path": str(wav_path.relative_to(out_dir)),
             "label": label,
-            "generator": "bonafide" if label == 0 else "inthewild_spoof",
+            "generator": "bonafide_wild" if label == 0 else "inthewild_spoof",
             "watermarked": False,
             "speaker_id": speaker_id,
             "split": split,
@@ -407,10 +548,38 @@ def build_from_hf_on_gpu(
         }
         records.append(rec)
         if label == 0 and 3.0 <= dur <= 9.0:
-            bonafide_refs.append(rec)
+            wild_refs.append(rec)
+        kept_itw += 1
+        pbar.update(1)
+    pbar.close()
+    print(f"InTheWild ready: {kept_itw} clips ({skipped_real} reused from disk).", flush=True)
 
-    print(f"InTheWild ready: {len(records)} clips ({skipped_real} reused from disk).", flush=True)
+    # 2. Clean bonafide read speech (LibriSpeech clean, official speaker-disjoint splits)
+    clean_records, clean_refs = _stream_librispeech_clean(
+        clean_dir=clean_dir,
+        out_dir=out_dir,
+        dataset_id=clean_real_dataset,
+        split_quotas={
+            "train": ("train.100", max_clean_train),
+            "val": ("validation", max_clean_val),
+            "test": ("test", max_clean_test),
+        },
+        min_duration_s=min_duration_s,
+        max_duration_s=max_duration_s,
+        seed=seed,
+    )
+    records.extend(clean_records)
 
+    # Mix both clean and wild bonafide reference voices for Chatterbox cloning (prevents ref-channel shortcut)
+    bonafide_refs: List[Dict] = []
+    max_len = max(len(wild_refs), len(clean_refs))
+    for k in range(max_len):
+        if k < len(clean_refs):
+            bonafide_refs.append(clean_refs[k])
+        if k < len(wild_refs):
+            bonafide_refs.append(wild_refs[k])
+
+    # 3. Unwatermarked Chatterbox-Turbo clones (disjoint text per clip)
     if max_chatterbox > 0 and bonafide_refs:
         missing_cb = [i for i in range(max_chatterbox) if not (cb_dir / f"cb_{i:05d}.wav").exists()]
         cb_model = None
@@ -472,6 +641,7 @@ def build_from_hf_on_gpu(
         if cb_model is not None:
             del cb_model
 
+    # 4. Held-out unseen Kokoro-82M test clips (disjoint sentences, unwatermarked)
     if max_kokoro > 0:
         kokoro_voices = ["af_heart", "af_bella", "am_adam", "am_michael", "bf_emma", "bm_george"]
         missing_k = [i for i in range(max_kokoro) if not (kokoro_dir / f"kokoro_{i:05d}.wav").exists()]
@@ -520,11 +690,17 @@ def build_from_hf_on_gpu(
                 print(f"[warn] Kokoro clip {i} skipped: {exc}", flush=True)
         if generated_k > 0:
             elapsed_k = max(time.perf_counter() - t_k, 1e-6)
-            print(f"[throughput] Kokoro-82M: {generated_k} clips in {elapsed_k:.1f}s ({generated_k / elapsed_k:.2f} clips/sec)", flush=True)
+            print(
+                f"[throughput] Kokoro-82M: {generated_k} clips in {elapsed_k:.1f}s ({generated_k / elapsed_k:.2f} clips/sec)",
+                flush=True,
+            )
 
     manifest_path = out_dir / "manifest.jsonl"
     _write_manifest_atomic(manifest_path, records)
+    summary = summarize_manifest_counts(records)
     print(f"Wrote {len(records)} rows to {manifest_path} (disjoint sentence check PASSED).", flush=True)
+    print("=== Final Real/Spoof Counts Per Split ===", flush=True)
+    print(json.dumps(summary, indent=2), flush=True)
     return manifest_path
 
 
@@ -532,12 +708,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate CloakBreak dataset & 2026 synthetic spoofs")
     parser.add_argument("--source", choices=["hf", "local"], default="hf")
     parser.add_argument("--local-real-dir", type=Path, default=None)
+    parser.add_argument("--local-clean-real-dir", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=Path("data/cloakbreak_v1"))
     parser.add_argument("--hf-dataset", type=str, default="SpeechAntiSpoofingBenchmarks/InTheWild")
+    parser.add_argument("--clean-real-dataset", type=str, default=DEFAULT_CLEAN_REAL_DATASET)
     parser.add_argument("--text-dataset", type=str, default=DEFAULT_TEXT_DATASET)
     parser.add_argument("--max-real", type=int, default=12000)
+    parser.add_argument("--max-clean-train", type=int, default=2600)
+    parser.add_argument("--max-clean-val", type=int, default=500)
+    parser.add_argument("--max-clean-test", type=int, default=600)
     parser.add_argument("--max-chatterbox", type=int, default=3000)
     parser.add_argument("--max-kokoro", type=int, default=600)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use-turbo", action="store_true", default=True)
     parser.add_argument("--keep-watermark", action="store_true", help="Keep Chatterbox Perth watermark (default: disabled)")
     parser.add_argument("--mock-generator", action="store_true")
@@ -552,17 +734,23 @@ def main() -> None:
             max_chatterbox=args.max_chatterbox,
             max_kokoro=args.max_kokoro,
             mock_generator=args.mock_generator,
+            clean_real_dir=args.local_clean_real_dir,
         )
     else:
         build_from_hf_on_gpu(
             out_dir=args.out_dir,
             hf_dataset=args.hf_dataset,
+            clean_real_dataset=args.clean_real_dataset,
             text_dataset=args.text_dataset,
             max_real=args.max_real,
+            max_clean_train=args.max_clean_train,
+            max_clean_val=args.max_clean_val,
+            max_clean_test=args.max_clean_test,
             max_chatterbox=args.max_chatterbox,
             max_kokoro=args.max_kokoro,
             use_turbo=args.use_turbo,
             disable_watermark=not args.keep_watermark,
+            seed=args.seed,
         )
 
 

@@ -71,6 +71,39 @@ def audio_rms(waveform: np.ndarray) -> float:
     return float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
 
 
+def estimate_snr_db(waveform: np.ndarray, sr: int = TARGET_SR, frame_ms: float = 25.0) -> float:
+    """Estimate signal-to-noise-floor ratio (dB) from 90th vs 10th percentile frame RMS."""
+    x = np.asarray(waveform, dtype=np.float64).reshape(-1)
+    frame_len = max(16, int(round(sr * frame_ms / 1000.0)))
+    n_frames = x.size // frame_len
+    if n_frames < 4:
+        return 0.0
+    frames = x[: n_frames * frame_len].reshape(n_frames, frame_len)
+    frame_rms = np.sqrt(np.mean(frames ** 2, axis=1))
+    sig_level = float(np.percentile(frame_rms, 90))
+    noise_floor = max(float(np.percentile(frame_rms, 10)), 1e-6)
+    if sig_level <= 1e-6:
+        return 0.0
+    snr = 20.0 * np.log10(sig_level / noise_floor)
+    return float(np.clip(snr, 0.0, 80.0))
+
+
+def spectral_rolloff_hz(waveform: np.ndarray, sr: int = TARGET_SR, roll_percent: float = 0.85) -> float:
+    """Frequency (Hz) below which roll_percent of total spectral energy resides."""
+    x = np.asarray(waveform, dtype=np.float64).reshape(-1)
+    if x.size < 32:
+        return 0.0
+    mag_sq = np.abs(np.fft.rfft(x)) ** 2
+    total = float(np.sum(mag_sq))
+    if total <= 1e-12:
+        return 0.0
+    cum = np.cumsum(mag_sq)
+    idx = int(np.searchsorted(cum, roll_percent * total))
+    idx = min(idx, mag_sq.size - 1)
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / float(sr))
+    return float(freqs[idx])
+
+
 def normalize_peak(waveform: np.ndarray, target_peak: float = PEAK_CEILING) -> np.ndarray:
     peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
     if peak < 1e-6:

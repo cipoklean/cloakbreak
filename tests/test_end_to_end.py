@@ -28,6 +28,7 @@ from src.generate_spoofs import (
     assert_disjoint_text_splits,
     build_from_local_dir,
     normalize_sentence_key,
+    summarize_manifest_counts,
 )
 from src.model import (
     CloakBreakDetector,
@@ -163,7 +164,7 @@ def test_disjoint_kokoro_and_chatterbox_sentences(dummy_real_dir: Path, tmp_path
 
 
 def test_shortcut_audit_catches_biased_and_clears_normalized(tmp_path: Path) -> None:
-    # 1. Deliberately biased dataset (real=4.0s loud, fake=1.5s quiet) must trigger warning
+    # 1. Deliberately biased duration/RMS dataset must trigger warning
     biased_dir = tmp_path / "biased"
     biased_rows = []
     for split in ("train", "test"):
@@ -174,16 +175,43 @@ def test_shortcut_audit_catches_biased_and_clears_normalized(tmp_path: Path) -> 
             fp = biased_dir / f"{split}_fake_{i}.wav"
             save_wav_mono(rp, r_wav, TARGET_SR)
             save_wav_mono(fp, f_wav, TARGET_SR)
-            biased_rows.append({"path": str(rp.relative_to(biased_dir)), "label": 0, "generator": "bonafide", "split": split})
+            biased_rows.append({"path": str(rp.relative_to(biased_dir)), "label": 0, "generator": "bonafide_wild", "split": split})
             biased_rows.append({"path": str(fp.relative_to(biased_dir)), "label": 1, "generator": "spoof", "split": split})
     biased_manifest = biased_dir / "manifest.jsonl"
     biased_manifest.write_text("\n".join(json.dumps(r) for r in biased_rows) + "\n", encoding="utf-8")
 
     biased_audit = run_shortcut_audit(biased_manifest)
-    assert biased_audit["raw_duration_rms"]["shortcut_warning"] is True
-    assert biased_audit["raw_duration_rms"]["auroc"] >= 0.90
+    assert biased_audit["raw_acoustic_shortcuts"]["shortcut_warning"] is True
+    assert biased_audit["raw_acoustic_shortcuts"]["auroc"] >= 0.90
 
-    # 2. Properly normalized dataset (same 2.5s duration + identical TARGET_RMS, disjoint seeds) must NOT trigger shortcut
+    # 2. Channel-mismatch shortcut (identical 2.5s duration + identical RMS, but noisy/narrow real vs clean/wide fake)
+    chan_dir = tmp_path / "channel_mismatch"
+    chan_rows = []
+    for split_idx, split in enumerate(("train", "test")):
+        for i in range(10):
+            base_seed = split_idx * 1000 + i
+            rng = np.random.default_rng(base_seed)
+            # Noisy narrowband real (phone_8k + noise floor)
+            r_raw = apply_phone_8k(_make_dummy_speech(2.5, freq_hz=200 + i * 5, seed=base_seed), TARGET_SR)
+            r_wav = normalize_loudness(r_raw + rng.normal(0.0, 0.04, size=r_raw.shape[0]).astype(np.float32))
+            # Clean wideband fake (zero noise floor, high-freq harmonic up to 6 kHz)
+            t = np.linspace(0.0, 2.5, int(TARGET_SR * 2.5), endpoint=False, dtype=np.float32)
+            gate = (np.sin(2.0 * np.pi * 1.5 * t) > 0.0).astype(np.float32)
+            f_wav = normalize_loudness(gate * (0.25 * np.sin(2.0 * np.pi * 240.0 * t) + 0.25 * np.sin(2.0 * np.pi * 5200.0 * t)))
+            rp = chan_dir / f"{split}_real_{i}.wav"
+            fp = chan_dir / f"{split}_fake_{i}.wav"
+            save_wav_mono(rp, r_wav, TARGET_SR)
+            save_wav_mono(fp, f_wav, TARGET_SR)
+            chan_rows.append({"path": str(rp.relative_to(chan_dir)), "label": 0, "generator": "bonafide_wild", "split": split})
+            chan_rows.append({"path": str(fp.relative_to(chan_dir)), "label": 1, "generator": "spoof", "split": split})
+    chan_manifest = chan_dir / "manifest.jsonl"
+    chan_manifest.write_text("\n".join(json.dumps(r) for r in chan_rows) + "\n", encoding="utf-8")
+
+    chan_audit = run_shortcut_audit(chan_manifest)
+    assert chan_audit["model_window_shortcuts"]["shortcut_warning"] is True
+    assert chan_audit["model_window_shortcuts"]["auroc"] >= 0.90
+
+    # 3. Matched acoustic distribution (same duration, RMS, SNR, bandwidth) must NOT trigger shortcut
     clean_dir = tmp_path / "clean"
     clean_rows = []
     for split_idx, split in enumerate(("train", "test")):
@@ -195,27 +223,35 @@ def test_shortcut_audit_catches_biased_and_clears_normalized(tmp_path: Path) -> 
             fp = clean_dir / f"{split}_fake_{i}.wav"
             save_wav_mono(rp, r_wav, TARGET_SR)
             save_wav_mono(fp, f_wav, TARGET_SR)
-            clean_rows.append({"path": str(rp.relative_to(clean_dir)), "label": 0, "generator": "bonafide", "split": split})
+            clean_rows.append({"path": str(rp.relative_to(clean_dir)), "label": 0, "generator": "bonafide_clean", "split": split})
             clean_rows.append({"path": str(fp.relative_to(clean_dir)), "label": 1, "generator": "spoof", "split": split})
     clean_manifest = clean_dir / "manifest.jsonl"
     clean_manifest.write_text("\n".join(json.dumps(r) for r in clean_rows) + "\n", encoding="utf-8")
 
     clean_audit = run_shortcut_audit(clean_manifest)
-    assert clean_audit["model_window_rms"]["shortcut_warning"] is False
-    assert clean_audit["model_window_rms"]["auroc"] == 0.5
+    assert clean_audit["model_window_shortcuts"]["shortcut_warning"] is False
 
 
 def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tmp_path: Path) -> None:
+    clean_real_dir = tmp_path / "clean_real_wavs"
+    clean_real_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(16):
+        wav = _make_dummy_speech(duration_s=2.5, freq_hz=160.0 + i * 12.0, seed=500 + i)
+        save_wav_mono(clean_real_dir / f"cln{i:02d}_utt0.wav", wav, TARGET_SR)
+
     data_dir = tmp_path / "dataset"
     manifest = build_from_local_dir(
         real_dir=dummy_real_dir,
+        clean_real_dir=clean_real_dir,
         out_dir=data_dir,
         max_chatterbox=12,
         max_kokoro=6,
         mock_generator=True,
     )
     rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(rows) == 16 + 12 + 6
+    assert len(rows) == 16 + 16 + 12 + 6
+    counts = summarize_manifest_counts(rows)
+    assert sum(counts[s]["total"] for s in ("train", "val", "test")) == len(rows)
     kokoro_rows = [r for r in rows if "kokoro" in r["generator"]]
     assert len(kokoro_rows) == 6
     assert all(r["split"] == "test" for r in kokoro_rows)
@@ -225,6 +261,7 @@ def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tm
     mtime_before = first_cb.stat().st_mtime_ns
     manifest_resumed = build_from_local_dir(
         real_dir=dummy_real_dir,
+        clean_real_dir=clean_real_dir,
         out_dir=data_dir,
         max_chatterbox=12,
         max_kokoro=6,
@@ -271,8 +308,13 @@ def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tm
     assert "test_opus_16k" in results
     assert "test_short_0.5s" in results
     assert "unseen_kokoro_clean" in results
+    assert "clean_real_vs_kokoro_clean" in results
+    assert "clean_real_vs_kokoro_opus_16k" in results
+    assert "clean_real_fpr" in results
+    assert 0.0 <= results["clean_real_fpr"]["cloakbreak_fpr_at_05_pct"] <= 100.0
     md = format_markdown_table(results)
-    assert "unseen_kokoro_clean" in md
+    assert "clean_real_vs_kokoro_clean" in md
+    assert "Clean human speech FPR@0.5" in md
     assert "shortcut_audit" not in md
 
 
