@@ -447,6 +447,7 @@ def _stream_librispeech_clean(
 def build_from_hf_on_gpu(
     out_dir: Path,
     hf_dataset: str = "SpeechAntiSpoofingBenchmarks/InTheWild",
+    hf_split: str = "auto",
     clean_real_dataset: str = DEFAULT_CLEAN_REAL_DATASET,
     text_dataset: str = DEFAULT_TEXT_DATASET,
     max_real: int = 12000,
@@ -472,7 +473,7 @@ def build_from_hf_on_gpu(
     5. Identical RMS loudness normalization & duration band [2.5s, 10.0s] across all real/fake clips.
     6. Logs exact per-split & per-generator counts + live throughput (clips/sec).
     """
-    from datasets import Audio, load_dataset
+    from datasets import Audio, get_dataset_split_names, load_dataset
     from tqdm import tqdm
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -503,8 +504,19 @@ def build_from_hf_on_gpu(
             encoding="utf-8",
         )
 
-    # 1. Shuffled InTheWild (prevents speaker/label ordering skew)
-    ds = load_dataset(hf_dataset, split="train").cast_column("audio", Audio(decode=False))
+    # 1. Shuffled InTheWild (prevents speaker/label ordering skew; InTheWild exposes 'test' split)
+    if hf_split == "auto":
+        avail_splits = list(get_dataset_split_names(hf_dataset))
+        if "test" in avail_splits and "train" not in avail_splits:
+            resolved_split = "test"
+        elif "train" in avail_splits:
+            resolved_split = "train"
+        else:
+            resolved_split = avail_splits[0]
+    else:
+        resolved_split = hf_split
+    print(f"Loading {hf_dataset} split='{resolved_split}'...", flush=True)
+    ds = load_dataset(hf_dataset, split=resolved_split).cast_column("audio", Audio(decode=False))
     ds = ds.shuffle(seed=seed)
 
     records: List[Dict] = []
@@ -753,6 +765,7 @@ def main() -> None:
     parser.add_argument("--local-clean-real-dir", type=Path, default=None)
     parser.add_argument("--out-dir", type=Path, default=Path("data/cloakbreak_v1"))
     parser.add_argument("--hf-dataset", type=str, default="SpeechAntiSpoofingBenchmarks/InTheWild")
+    parser.add_argument("--hf-split", type=str, default="auto")
     parser.add_argument("--clean-real-dataset", type=str, default=DEFAULT_CLEAN_REAL_DATASET)
     parser.add_argument("--text-dataset", type=str, default=DEFAULT_TEXT_DATASET)
     parser.add_argument("--max-real", type=int, default=12000)
@@ -782,6 +795,7 @@ def main() -> None:
         build_from_hf_on_gpu(
             out_dir=args.out_dir,
             hf_dataset=args.hf_dataset,
+            hf_split=args.hf_split,
             clean_real_dataset=args.clean_real_dataset,
             text_dataset=args.text_dataset,
             max_real=args.max_real,

@@ -58,7 +58,7 @@ def compute_eer_and_auroc(labels: Sequence[int], scores: Sequence[float]) -> Dic
 
     tpr_curve = np.concatenate([[0.0], tpr])
     fpr_curve = np.concatenate([[0.0], fpr])
-    auroc = float(np.trapezoid(tpr_curve, fpr_curve))
+    auroc = float(np.trapz(tpr_curve, fpr_curve))
 
     fnr_curve = 1.0 - tpr_curve
     diff = fpr_curve - fnr_curve
