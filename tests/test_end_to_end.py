@@ -9,21 +9,28 @@ from fastapi.testclient import TestClient
 
 from app.main import AppState, create_app
 from src.audio_utils import (
+    TARGET_RMS,
     TARGET_SR,
     RollingAudioBuffer,
+    audio_rms,
     float32_to_pcm16_bytes,
     load_wav_mono,
+    normalize_loudness,
     pcm16_bytes_to_float32,
     rms_vad,
     save_wav_mono,
     wav_to_bytes,
 )
-from src.augment import TrainCodecAugmenter, apply_opus_codec, apply_phone_8k, degrade_for_eval
-from src.eval import compute_eer_and_auroc, format_markdown_table, run_evaluation
-from src.generate_spoofs import build_from_local_dir
+from src.augment import TrainCodecAugmenter, apply_opus_codec, apply_phone_8k, degrade_for_eval, precompute_opus_cache
+from src.eval import compute_eer_and_auroc, format_markdown_table, run_evaluation, run_shortcut_audit
+from src.generate_spoofs import (
+    DEMO_PROMPTS,
+    assert_disjoint_text_splits,
+    build_from_local_dir,
+    normalize_sentence_key,
+)
 from src.model import (
     CloakBreakDetector,
-    MockDetectorRuntime,
     OnnxDetectorRuntime,
     TorchDetectorRuntime,
     export_to_onnx,
@@ -46,14 +53,19 @@ def _make_dummy_speech(duration_s: float = 2.5, freq_hz: float = 220.0, seed: in
 def dummy_real_dir(tmp_path: Path) -> Path:
     real_dir = tmp_path / "real_wavs"
     real_dir.mkdir(parents=True, exist_ok=True)
-    for i in range(12):
+    for i in range(16):
         wav = _make_dummy_speech(duration_s=2.5, freq_hz=150.0 + i * 15.0, seed=i)
         save_wav_mono(real_dir / f"spk{i:02d}_utt0.wav", wav, TARGET_SR)
     return real_dir
 
 
-def test_audio_utils_and_rolling_buffer(tmp_path: Path) -> None:
+def test_audio_utils_loudness_and_rolling_buffer(tmp_path: Path) -> None:
     wav = _make_dummy_speech(1.0)
+    quiet = normalize_loudness(wav * 0.05)
+    loud = normalize_loudness(wav * 0.9)
+    assert abs(audio_rms(quiet) - TARGET_RMS) < 0.005
+    assert abs(audio_rms(loud) - TARGET_RMS) < 0.005
+
     p = tmp_path / "sample.wav"
     save_wav_mono(p, wav, TARGET_SR)
     loaded, sr = load_wav_mono(p, TARGET_SR)
@@ -73,7 +85,7 @@ def test_audio_utils_and_rolling_buffer(tmp_path: Path) -> None:
     assert ring.get_window().shape == (int(2.5 * TARGET_SR),)
 
 
-def test_augmentations_including_opus_and_phone() -> None:
+def test_augmentations_and_opus_precompute_cache(tmp_path: Path) -> None:
     wav = _make_dummy_speech(2.0)
     phone = apply_phone_8k(wav, TARGET_SR)
     assert phone.shape == wav.shape
@@ -86,10 +98,111 @@ def test_augmentations_including_opus_and_phone() -> None:
     short = degrade_for_eval(wav, "short_0.5s", TARGET_SR)
     assert short.shape == (int(0.5 * TARGET_SR),)
 
+    src_wav = tmp_path / "src.wav"
+    save_wav_mono(src_wav, wav, TARGET_SR)
+    cache_dir = tmp_path / "opus_cache"
+    mapping = precompute_opus_cache([str(src_wav)], cache_dir=cache_dir, bitrate_kbps=16, num_workers=1)
+    cached_path = Path(mapping[str(src_wav)])
+    assert cached_path.exists()
+    mtime_1 = cached_path.stat().st_mtime_ns
+    # Re-running cache must skip already-cached file
+    precompute_opus_cache([str(src_wav)], cache_dir=cache_dir, bitrate_kbps=16, num_workers=1)
+    assert cached_path.stat().st_mtime_ns == mtime_1
+
+    cached_wav, _ = load_wav_mono(cached_path, TARGET_SR)
     aug = TrainCodecAugmenter(p_codec=1.0, p_noise=1.0, p_clip=1.0, seed=7)
-    out = aug(wav, TARGET_SR)
+    out = aug(wav, TARGET_SR, cached_opus_waveform=cached_wav)
     assert out.shape == wav.shape
-    assert float(np.max(np.abs(out))) <= 1.0
+    assert abs(audio_rms(out) - TARGET_RMS) < 0.01
+
+
+def test_disjoint_kokoro_and_chatterbox_sentences(dummy_real_dir: Path, tmp_path: Path) -> None:
+    data_dir = tmp_path / "dataset"
+    manifest = build_from_local_dir(
+        real_dir=dummy_real_dir,
+        out_dir=data_dir,
+        max_chatterbox=12,
+        max_kokoro=8,
+        mock_generator=True,
+    )
+    rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
+    train_val_texts = {
+        normalize_sentence_key(r["text"])
+        for r in rows
+        if r.get("split") in {"train", "val"} and r.get("text")
+    }
+    cb_texts = {
+        normalize_sentence_key(r["text"])
+        for r in rows
+        if "chatterbox" in r["generator"] and r.get("text")
+    }
+    kokoro_texts = {
+        normalize_sentence_key(r["text"])
+        for r in rows
+        if "kokoro" in r["generator"] and r.get("text")
+    }
+    demo_texts = {normalize_sentence_key(p) for p in DEMO_PROMPTS}
+
+    assert len(cb_texts) == 12
+    assert len(kokoro_texts) == 8
+    assert kokoro_texts.isdisjoint(train_val_texts)
+    assert kokoro_texts.isdisjoint(cb_texts)
+    assert cb_texts.isdisjoint(demo_texts)
+    assert kokoro_texts.isdisjoint(demo_texts)
+    assert all(r["watermarked"] is False for r in rows if "chatterbox" in r["generator"])
+
+    # Inject a leaked sentence and confirm the guard catches it
+    leaked_rows = [dict(r) for r in rows]
+    sample_train_text = next(r["text"] for r in rows if "chatterbox" in r["generator"])
+    for r in leaked_rows:
+        if "kokoro" in r["generator"]:
+            r["text"] = sample_train_text
+            break
+    with pytest.raises(ValueError, match="Sentence leakage"):
+        assert_disjoint_text_splits(leaked_rows)
+
+
+def test_shortcut_audit_catches_biased_and_clears_normalized(tmp_path: Path) -> None:
+    # 1. Deliberately biased dataset (real=4.0s loud, fake=1.5s quiet) must trigger warning
+    biased_dir = tmp_path / "biased"
+    biased_rows = []
+    for split in ("train", "test"):
+        for i in range(10):
+            r_wav = _make_dummy_speech(4.0, freq_hz=180 + i * 5, seed=i) * 0.9
+            f_wav = _make_dummy_speech(1.5, freq_hz=180 + i * 5, seed=100 + i) * 0.08
+            rp = biased_dir / f"{split}_real_{i}.wav"
+            fp = biased_dir / f"{split}_fake_{i}.wav"
+            save_wav_mono(rp, r_wav, TARGET_SR)
+            save_wav_mono(fp, f_wav, TARGET_SR)
+            biased_rows.append({"path": str(rp.relative_to(biased_dir)), "label": 0, "generator": "bonafide", "split": split})
+            biased_rows.append({"path": str(fp.relative_to(biased_dir)), "label": 1, "generator": "spoof", "split": split})
+    biased_manifest = biased_dir / "manifest.jsonl"
+    biased_manifest.write_text("\n".join(json.dumps(r) for r in biased_rows) + "\n", encoding="utf-8")
+
+    biased_audit = run_shortcut_audit(biased_manifest)
+    assert biased_audit["raw_duration_rms"]["shortcut_warning"] is True
+    assert biased_audit["raw_duration_rms"]["auroc"] >= 0.90
+
+    # 2. Properly normalized dataset (same 2.5s duration + identical TARGET_RMS, disjoint seeds) must NOT trigger shortcut
+    clean_dir = tmp_path / "clean"
+    clean_rows = []
+    for split_idx, split in enumerate(("train", "test")):
+        for i in range(12):
+            base_seed = split_idx * 1000 + i
+            r_wav = normalize_loudness(_make_dummy_speech(2.5, freq_hz=170 + i * 7, seed=base_seed))
+            f_wav = normalize_loudness(_make_dummy_speech(2.5, freq_hz=170 + i * 7, seed=base_seed + 500))
+            rp = clean_dir / f"{split}_real_{i}.wav"
+            fp = clean_dir / f"{split}_fake_{i}.wav"
+            save_wav_mono(rp, r_wav, TARGET_SR)
+            save_wav_mono(fp, f_wav, TARGET_SR)
+            clean_rows.append({"path": str(rp.relative_to(clean_dir)), "label": 0, "generator": "bonafide", "split": split})
+            clean_rows.append({"path": str(fp.relative_to(clean_dir)), "label": 1, "generator": "spoof", "split": split})
+    clean_manifest = clean_dir / "manifest.jsonl"
+    clean_manifest.write_text("\n".join(json.dumps(r) for r in clean_rows) + "\n", encoding="utf-8")
+
+    clean_audit = run_shortcut_audit(clean_manifest)
+    assert clean_audit["model_window_rms"]["shortcut_warning"] is False
+    assert clean_audit["model_window_rms"]["auroc"] == 0.5
 
 
 def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tmp_path: Path) -> None:
@@ -102,7 +215,7 @@ def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tm
         mock_generator=True,
     )
     rows = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines() if line.strip()]
-    assert len(rows) == 12 + 12 + 6
+    assert len(rows) == 16 + 12 + 6
     kokoro_rows = [r for r in rows if "kokoro" in r["generator"]]
     assert len(kokoro_rows) == 6
     assert all(r["split"] == "test" for r in kokoro_rows)
@@ -120,6 +233,7 @@ def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tm
     assert manifest_resumed == manifest
     assert first_cb.stat().st_mtime_ns == mtime_before
 
+    # Train using precomputed Opus cache + multi-worker DataLoader (num_workers=2)
     ckpt_dir = tmp_path / "checkpoints"
     summary = train_model(
         manifest_path=manifest,
@@ -128,12 +242,15 @@ def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tm
         epochs_stage2=1,
         batch_size=4,
         use_tiny_test_backbone=True,
-        allow_opus=False,
+        precompute_opus=True,
+        num_workers=2,
         device_str="cpu",
     )
     assert Path(summary["best_ckpt"]).exists()
     assert Path(summary["fp32_onnx"]).exists()
     assert Path(summary["int8_onnx"]).exists()
+    assert summary["history"][0]["num_workers"] == 2
+    assert summary["history"][0]["steps_per_sec"] > 0
 
     torch_rt = TorchDetectorRuntime(summary["best_ckpt"], device="cpu")
     onnx_rt = OnnxDetectorRuntime(summary["int8_onnx"])
@@ -148,12 +265,15 @@ def test_generate_train_export_onnx_and_eval_end_to_end(dummy_real_dir: Path, tm
     eval_json = tmp_path / "eval_results.json"
     results = run_evaluation(manifest, detector=onnx_rt, max_per_slice=12, out_json=eval_json)
     assert eval_json.exists()
+    assert "shortcut_audit" in results
+    assert results["shortcut_audit"]["disjoint_text_check"] == "PASSED"
     assert "test_clean" in results
     assert "test_opus_16k" in results
     assert "test_short_0.5s" in results
     assert "unseen_kokoro_clean" in results
     md = format_markdown_table(results)
     assert "unseen_kokoro_clean" in md
+    assert "shortcut_audit" not in md
 
 
 def test_eer_and_auroc_math() -> None:
@@ -194,15 +314,12 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
     assert len(det["attention_focus"]) == 32
     assert det["condition"] == "opus_16k"
 
-    # Clone endpoint must be disabled by default
-    r_clone_disabled = client.post(
+    assert client.post(
         "/api/clone",
         files={"reference_wav": ("ref.wav", wav_bytes, "audio/wav")},
         data={"text": "Hello test"},
-    )
-    assert r_clone_disabled.status_code == 403
+    ).status_code == 403
 
-    # WebSocket streaming: silence then voiced speech
     with client.websocket_connect("/ws/detect") as ws:
         ws.send_json({"condition": "phone_8k"})
         ack = ws.receive_json()
@@ -238,7 +355,6 @@ def test_fastapi_private_clone_auth_and_onnx_backend(monkeypatch: pytest.MonkeyP
     assert h["clone_enabled"] is True
 
     wav_bytes = wav_to_bytes(_make_dummy_speech(2.5), TARGET_SR)
-    # Missing or wrong token rejected
     assert client.post(
         "/api/clone",
         files={"reference_wav": ("ref.wav", wav_bytes, "audio/wav")},
@@ -251,7 +367,6 @@ def test_fastapi_private_clone_auth_and_onnx_backend(monkeypatch: pytest.MonkeyP
         headers={"Authorization": "Bearer wrong-token"},
     ).status_code == 401
 
-    # Valid ONNX detection via FastAPI
     r_det = client.post(
         "/api/detect-file",
         files={"file": ("test.wav", wav_bytes, "audio/wav")},
@@ -260,7 +375,6 @@ def test_fastapi_private_clone_auth_and_onnx_backend(monkeypatch: pytest.MonkeyP
     assert r_det.status_code == 200
     assert r_det.json()["backend"].startswith("onnx:")
 
-    # Valid authorized clone in mock mode returns decodable 16 kHz WAV
     monkeypatch.setenv("CLOAKBREAK_BACKEND", "mock")
     mock_client = TestClient(create_app(AppState()))
     r_ok = mock_client.post(

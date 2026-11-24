@@ -9,6 +9,8 @@ import soundfile as sf
 from scipy.signal import resample_poly
 
 TARGET_SR = 16000
+TARGET_RMS = 0.0708  # approx -23 dBFS
+PEAK_CEILING = 0.95
 
 
 def resample_audio(waveform: np.ndarray, orig_sr: int, target_sr: int = TARGET_SR) -> np.ndarray:
@@ -63,14 +65,42 @@ def float32_to_pcm16_bytes(waveform: np.ndarray) -> bytes:
     return (clipped * 32767.0).astype(np.int16).tobytes()
 
 
-def normalize_peak(waveform: np.ndarray, target_peak: float = 0.95) -> np.ndarray:
+def audio_rms(waveform: np.ndarray) -> float:
+    if waveform.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(waveform.astype(np.float64) ** 2)))
+
+
+def normalize_peak(waveform: np.ndarray, target_peak: float = PEAK_CEILING) -> np.ndarray:
     peak = float(np.max(np.abs(waveform))) if waveform.size else 0.0
     if peak < 1e-6:
         return waveform.astype(np.float32, copy=False)
     return (waveform * (target_peak / peak)).astype(np.float32)
 
 
-def pad_or_crop(waveform: np.ndarray, num_samples: int, random_crop: bool = False, rng: np.random.Generator | None = None) -> np.ndarray:
+def normalize_loudness(
+    waveform: np.ndarray,
+    target_rms: float = TARGET_RMS,
+    peak_ceiling: float = PEAK_CEILING,
+) -> np.ndarray:
+    """Normalize clip RMS loudness and apply peak ceiling identically across real & spoof."""
+    x = waveform.astype(np.float32, copy=False)
+    rms = audio_rms(x)
+    if rms < 1e-6:
+        return x
+    scaled = x * (target_rms / rms)
+    peak = float(np.max(np.abs(scaled)))
+    if peak > peak_ceiling:
+        scaled = scaled * (peak_ceiling / peak)
+    return np.clip(scaled, -1.0, 1.0).astype(np.float32)
+
+
+def pad_or_crop(
+    waveform: np.ndarray,
+    num_samples: int,
+    random_crop: bool = False,
+    rng: np.random.Generator | None = None,
+) -> np.ndarray:
     n = waveform.shape[0]
     if n == num_samples:
         return waveform.astype(np.float32, copy=False)
@@ -87,10 +117,7 @@ def pad_or_crop(waveform: np.ndarray, num_samples: int, random_crop: bool = Fals
 
 
 def rms_vad(waveform: np.ndarray, threshold: float = 0.012) -> bool:
-    if waveform.size == 0:
-        return False
-    rms = float(np.sqrt(np.mean(waveform.astype(np.float32) ** 2)))
-    return rms >= threshold
+    return audio_rms(waveform) >= threshold
 
 
 class RollingAudioBuffer:

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from src.audio_utils import TARGET_SR, pad_or_crop
+from src.audio_utils import TARGET_SR, normalize_loudness, pad_or_crop
 
 DEFAULT_BACKBONE_ID = "microsoft/wavlm-base-plus"
 FALLBACK_BACKBONE_ID = "facebook/wav2vec2-base"
@@ -219,7 +219,7 @@ class OnnxDetectorRuntime:
 
     def predict(self, waveform: np.ndarray) -> DetectionResult:
         t0 = time.perf_counter()
-        fixed = pad_or_crop(waveform, self.window_samples, random_crop=False)
+        fixed = normalize_loudness(pad_or_crop(waveform, self.window_samples, random_crop=False))
         inp = fixed[np.newaxis, :].astype(np.float32)
         logit, attn = self.session.run(None, {"input_values": inp})
         val = float(np.asarray(logit).reshape(-1)[0])
@@ -257,7 +257,7 @@ class TorchDetectorRuntime:
     @torch.inference_mode()
     def predict(self, waveform: np.ndarray) -> DetectionResult:
         t0 = time.perf_counter()
-        fixed = pad_or_crop(waveform, self.window_samples, random_crop=False)
+        fixed = normalize_loudness(pad_or_crop(waveform, self.window_samples, random_crop=False))
         tensor = torch.from_numpy(fixed).unsqueeze(0).to(self.device)
         with torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda"):
             logit, attn = self.model(tensor)
@@ -299,7 +299,7 @@ class BaselineDetectorRuntime:
 
     @torch.inference_mode()
     def predict_prob(self, waveform: np.ndarray) -> float:
-        fixed = pad_or_crop(waveform, self.window_samples, random_crop=False)
+        fixed = normalize_loudness(pad_or_crop(waveform, self.window_samples, random_crop=False))
         inputs = self.extractor(fixed, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         logits = self.model(**inputs).logits

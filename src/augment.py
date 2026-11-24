@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Literal
+from typing import Dict, List, Literal, Tuple
 
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-from src.audio_utils import TARGET_SR, load_wav_mono, resample_audio, save_wav_mono
+from src.audio_utils import TARGET_SR, load_wav_mono, normalize_loudness, resample_audio, save_wav_mono
 
 EvalCondition = Literal["clean", "opus_16k", "phone_8k", "noise_10db", "noise_5db", "short_0.5s", "short_0.8s"]
 
@@ -84,6 +87,50 @@ def apply_opus_codec(waveform: np.ndarray, sr: int = TARGET_SR, bitrate_kbps: in
         return np.clip(decoded, -1.0, 1.0).astype(np.float32)
 
 
+def _precompute_one_opus(args: Tuple[str, str, int]) -> Tuple[str, str]:
+    src_str, dst_str, bitrate_kbps = args
+    dst = Path(dst_str)
+    if not (dst.exists() and dst.stat().st_size > 100):
+        wav, sr = load_wav_mono(src_str, target_sr=TARGET_SR)
+        degraded = apply_opus_codec(wav, sr=sr, bitrate_kbps=bitrate_kbps)
+        degraded = normalize_loudness(degraded)
+        save_wav_mono(dst, degraded, TARGET_SR)
+    return src_str, dst_str
+
+
+def precompute_opus_cache(
+    wav_paths: List[str],
+    cache_dir: str | Path,
+    bitrate_kbps: int = 16,
+    num_workers: int | None = None,
+) -> Dict[str, str]:
+    """Pre-compute Opus-degraded WAV variants once in parallel across vCPUs.
+
+    Eliminates per-step ffmpeg subprocess spawning inside training DataLoader
+    workers so the GPU never sits idle waiting on CPU subprocesses.
+    """
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    unique_paths = sorted(set(wav_paths))
+    tasks: List[Tuple[str, str, int]] = []
+    for p in unique_paths:
+        key = hashlib.sha1(f"{p}:{bitrate_kbps}".encode("utf-8")).hexdigest()[:16]
+        dst = cache_path / f"{key}.wav"
+        tasks.append((p, str(dst), bitrate_kbps))
+
+    workers = num_workers if num_workers is not None else min(os.cpu_count() or 2, 12)
+    mapping: Dict[str, str] = {}
+    if workers <= 1 or len(tasks) <= 4:
+        for item in tasks:
+            src_s, dst_s = _precompute_one_opus(item)
+            mapping[src_s] = dst_s
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as ex:
+            for src_s, dst_s in ex.map(_precompute_one_opus, tasks, chunksize=8):
+                mapping[src_s] = dst_s
+    return mapping
+
+
 def apply_additive_noise(
     waveform: np.ndarray,
     snr_db: float = 15.0,
@@ -110,41 +157,57 @@ def degrade_for_eval(
 ) -> np.ndarray:
     rng = np.random.default_rng(seed)
     if condition == "clean":
-        return waveform.astype(np.float32, copy=False)
+        return normalize_loudness(waveform)
     if condition == "opus_16k":
-        return apply_opus_codec(waveform, sr=sr, bitrate_kbps=16)
+        return normalize_loudness(apply_opus_codec(waveform, sr=sr, bitrate_kbps=16))
     if condition == "phone_8k":
-        return apply_phone_8k(waveform, sr=sr)
+        return normalize_loudness(apply_phone_8k(waveform, sr=sr))
     if condition == "noise_10db":
-        return apply_additive_noise(waveform, snr_db=10.0, rng=rng)
+        return normalize_loudness(apply_additive_noise(waveform, snr_db=10.0, rng=rng))
     if condition == "noise_5db":
-        return apply_additive_noise(waveform, snr_db=5.0, rng=rng)
+        return normalize_loudness(apply_additive_noise(waveform, snr_db=5.0, rng=rng))
     if condition == "short_0.5s":
-        return waveform[: int(0.5 * sr)].astype(np.float32, copy=False)
+        return normalize_loudness(waveform[: int(0.5 * sr)])
     if condition == "short_0.8s":
-        return waveform[: int(0.8 * sr)].astype(np.float32, copy=False)
+        return normalize_loudness(waveform[: int(0.8 * sr)])
     raise ValueError(f"Unknown eval condition: {condition}")
 
 
 class TrainCodecAugmenter:
+    """Fast CPU-worker augmentation without per-step ffmpeg blocking.
+
+    When opus_cache is provided, Opus codec augmentation loads the pre-cached
+    Opus variant directly from disk (microseconds) instead of spawning ffmpeg.
+    """
+
     def __init__(
         self,
         p_codec: float = 0.6,
         p_noise: float = 0.5,
         p_clip: float = 0.15,
-        allow_opus: bool = True,
+        allow_inline_opus: bool = False,
         seed: int | None = None,
     ) -> None:
         self.p_codec = p_codec
         self.p_noise = p_noise
         self.p_clip = p_clip
-        self.allow_opus = allow_opus and has_ffmpeg()
+        self.allow_inline_opus = allow_inline_opus and has_ffmpeg()
         self.rng = np.random.default_rng(seed)
 
-    def __call__(self, waveform: np.ndarray, sr: int = TARGET_SR) -> np.ndarray:
+    def reseed(self, seed: int) -> None:
+        self.rng = np.random.default_rng(seed)
+
+    def __call__(
+        self,
+        waveform: np.ndarray,
+        sr: int = TARGET_SR,
+        cached_opus_waveform: np.ndarray | None = None,
+    ) -> np.ndarray:
         x = waveform.astype(np.float32, copy=True)
         if self.rng.random() < self.p_codec:
-            if self.allow_opus and self.rng.random() < 0.5:
+            if cached_opus_waveform is not None and self.rng.random() < 0.55:
+                x = cached_opus_waveform.astype(np.float32, copy=True)
+            elif self.allow_inline_opus and self.rng.random() < 0.5:
                 bitrate = int(self.rng.choice([12, 16, 24]))
                 x = apply_opus_codec(x, sr=sr, bitrate_kbps=bitrate)
             else:
@@ -155,4 +218,4 @@ class TrainCodecAugmenter:
         if self.rng.random() < self.p_clip:
             drive = float(self.rng.uniform(1.3, 2.5))
             x = apply_soft_clipping(x, drive=drive)
-        return np.clip(x, -1.0, 1.0).astype(np.float32)
+        return normalize_loudness(x)
