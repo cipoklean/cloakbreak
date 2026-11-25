@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Literal, Tuple
@@ -103,11 +104,13 @@ def precompute_opus_cache(
     cache_dir: str | Path,
     bitrate_kbps: int = 16,
     num_workers: int | None = None,
+    progress_every: int = 1000,
 ) -> Dict[str, str]:
     """Pre-compute Opus-degraded WAV variants once in parallel across vCPUs.
 
     Eliminates per-step ffmpeg subprocess spawning inside training DataLoader
     workers so the GPU never sits idle waiting on CPU subprocesses.
+    Prints a ``[cache]`` progress line every ``progress_every`` completed items.
     """
     cache_path = Path(cache_dir)
     cache_path.mkdir(parents=True, exist_ok=True)
@@ -118,16 +121,38 @@ def precompute_opus_cache(
         dst = cache_path / f"{key}.wav"
         tasks.append((p, str(dst), bitrate_kbps))
 
+    total = len(tasks)
+    reused = sum(
+        1 for _, dst_s, _ in tasks if (Path(dst_s).exists() and Path(dst_s).stat().st_size > 100)
+    )
     workers = num_workers if num_workers is not None else min(os.cpu_count() or 2, 12)
     mapping: Dict[str, str] = {}
-    if workers <= 1 or len(tasks) <= 4:
+    done = 0
+    t0 = time.perf_counter()
+    step = max(1, int(progress_every))
+
+    def _report() -> None:
+        elapsed = max(time.perf_counter() - t0, 1e-6)
+        print(
+            f"[cache] {done}/{total} Opus clips ({done / elapsed:.1f} clips/s, {reused} already cached)",
+            flush=True,
+        )
+
+    if workers <= 1 or total <= 4:
         for item in tasks:
             src_s, dst_s = _precompute_one_opus(item)
             mapping[src_s] = dst_s
+            done += 1
+            if done % step == 0:
+                _report()
     else:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             for src_s, dst_s in ex.map(_precompute_one_opus, tasks, chunksize=8):
                 mapping[src_s] = dst_s
+                done += 1
+                if done % step == 0:
+                    _report()
+    _report()
     return mapping
 
 

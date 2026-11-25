@@ -123,6 +123,17 @@ def run_import_sweep() -> None:
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CloakBreak Vast GPU preflight")
+    parser.add_argument(
+        "--skip-tts",
+        action="store_true",
+        help="Skip Chatterbox/Kokoro synthesis checks and espeak-ng binary check (Session 2 restore-only runs)",
+    )
+    args = parser.parse_args()
+    skip_tts = args.skip_tts
+
     t_start = time.perf_counter()
 
     print("\n[preflight] step 0 — HF token & dataset-namespace check (scripts.hf_auth_check)...", flush=True)
@@ -130,8 +141,9 @@ def main() -> None:
 
     hf_auth_check.main()
 
-    _step("1/7 System binaries (nvidia-smi, ffmpeg libopus, espeak-ng)")
-    for binary in ("nvidia-smi", "ffmpeg", "espeak-ng"):
+    _step("1/7 System binaries (nvidia-smi, ffmpeg libopus" + (", espeak-ng)" if not skip_tts else ")"))
+    binaries = ["nvidia-smi", "ffmpeg"] + ([] if skip_tts else ["espeak-ng"])
+    for binary in binaries:
         if shutil.which(binary) is None:
             sys.exit(f"PREFLIGHT FAIL: required binary '{binary}' not found on PATH.")
     nvsmi = subprocess.run(
@@ -160,44 +172,48 @@ def main() -> None:
     free_b, total_b = torch.cuda.mem_get_info()
     print(f"  VRAM: {free_b / 1e9:.1f} GB free / {total_b / 1e9:.1f} GB total")
 
-    _step("4/7 Synthetic 6.0s reference clip (Chatterbox-Turbo requires > 5.0s)")
-    tmpdir = Path(tempfile.mkdtemp(prefix="cloakbreak_preflight_"))
-    ref_wav = tmpdir / "ref_6s.wav"
-    t = np.linspace(0.0, 6.0, TARGET_SR * 6, endpoint=False, dtype=np.float32)
-    wave = (0.25 * np.sin(2.0 * np.pi * 210.0 * t)).astype(np.float32)
-    save_wav_mono(ref_wav, wave, TARGET_SR)
+    if skip_tts:
+        print("\n[preflight] steps 4-6 skipped (--skip-tts): Chatterbox/Kokoro synthesis not required.", flush=True)
+    else:
+        _step("4/7 Synthetic 6.0s reference clip (Chatterbox-Turbo requires > 5.0s)")
+        tmpdir = Path(tempfile.mkdtemp(prefix="cloakbreak_preflight_"))
+        ref_wav = tmpdir / "ref_6s.wav"
+        t = np.linspace(0.0, 6.0, TARGET_SR * 6, endpoint=False, dtype=np.float32)
+        wave = (0.25 * np.sin(2.0 * np.pi * 210.0 * t)).astype(np.float32)
+        save_wav_mono(ref_wav, wave, TARGET_SR)
 
-    _step("5/7 Load Chatterbox-Turbo on CUDA & synthesize 1 test clip")
-    try:
-        from chatterbox.tts_turbo import ChatterboxTurboTTS
-        from src.generate_spoofs import _NoOpWatermarker
+    if not skip_tts:
+        _step("5/7 Load Chatterbox-Turbo on CUDA & synthesize 1 test clip")
+        try:
+            from chatterbox.tts_turbo import ChatterboxTurboTTS
+            from src.generate_spoofs import _NoOpWatermarker
 
-        cb = ChatterboxTurboTTS.from_pretrained(device="cuda")
-        cb.watermarker = _NoOpWatermarker()
-        out_cb = cb.generate("Preflight voice check on Vast.", audio_prompt_path=str(ref_wav))
-        arr_cb = out_cb.squeeze().detach().cpu().numpy()
-        if arr_cb.size < 1000 or not np.isfinite(arr_cb).all():
-            sys.exit("PREFLIGHT FAIL: Chatterbox produced empty or non-finite audio.")
-        print(f"  Chatterbox-Turbo OK: {arr_cb.shape} @ {cb.sr} Hz")
-        del cb
-        torch.cuda.empty_cache()
-    except Exception as exc:
-        sys.exit(f"PREFLIGHT FAIL (Chatterbox): {exc}")
+            cb = ChatterboxTurboTTS.from_pretrained(device="cuda")
+            cb.watermarker = _NoOpWatermarker()
+            out_cb = cb.generate("Preflight voice check on Vast.", audio_prompt_path=str(ref_wav))
+            arr_cb = out_cb.squeeze().detach().cpu().numpy()
+            if arr_cb.size < 1000 or not np.isfinite(arr_cb).all():
+                sys.exit("PREFLIGHT FAIL: Chatterbox produced empty or non-finite audio.")
+            print(f"  Chatterbox-Turbo OK: {arr_cb.shape} @ {cb.sr} Hz")
+            del cb
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            sys.exit(f"PREFLIGHT FAIL (Chatterbox): {exc}")
 
-    _step("6/7 Load Kokoro-82M & synthesize 1 test clip")
-    try:
-        from kokoro import KPipeline
+        _step("6/7 Load Kokoro-82M & synthesize 1 test clip")
+        try:
+            from kokoro import KPipeline
 
-        pipe = KPipeline(lang_code="a")
-        chunks = [np.asarray(a, dtype=np.float32) for _, _, a in pipe("Preflight Kokoro test.", voice="af_heart")]
-        arr_k = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
-        if arr_k.size < 1000 or not np.isfinite(arr_k).all():
-            sys.exit("PREFLIGHT FAIL: Kokoro-82M produced empty or non-finite audio.")
-        print(f"  Kokoro-82M OK: {arr_k.shape} @ 24000 Hz")
-        del pipe
-        torch.cuda.empty_cache()
-    except Exception as exc:
-        sys.exit(f"PREFLIGHT FAIL (Kokoro): {exc}")
+            pipe = KPipeline(lang_code="a")
+            chunks = [np.asarray(a, dtype=np.float32) for _, _, a in pipe("Preflight Kokoro test.", voice="af_heart")]
+            arr_k = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
+            if arr_k.size < 1000 or not np.isfinite(arr_k).all():
+                sys.exit("PREFLIGHT FAIL: Kokoro-82M produced empty or non-finite audio.")
+            print(f"  Kokoro-82M OK: {arr_k.shape} @ 24000 Hz")
+            del pipe
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            sys.exit(f"PREFLIGHT FAIL (Kokoro): {exc}")
 
     _step("7/7 Load microsoft/wavlm-base-plus CloakBreakDetector & run 1 CUDA forward pass")
     try:
@@ -215,7 +231,8 @@ def main() -> None:
     except Exception as exc:
         sys.exit(f"PREFLIGHT FAIL (WavLM): {exc}")
 
-    shutil.rmtree(tmpdir, ignore_errors=True)
+    if not skip_tts:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     elapsed = time.perf_counter() - t_start
     print(f"\nPREFLIGHT PASSED in {elapsed:.1f}s — ready for GPU work.", flush=True)
 

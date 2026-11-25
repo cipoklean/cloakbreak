@@ -59,15 +59,15 @@ def _token_role_and_fine_grained(whoami: dict) -> tuple[str, dict]:
     return str(role), fine_grained if isinstance(fine_grained, dict) else {}
 
 
-def validate_hf_identity(whoami: dict, repo_id: str) -> str:
+def validate_hf_identity(whoami: dict, repo_id: str, env_name: str = "HF_DATASET_REPO") -> str:
     """Validate repo namespace vs token owner + write permission. Returns OK message."""
     if not isinstance(repo_id, str):
-        raise HfAuthError(f"HF_DATASET_REPO must be a string in 'namespace/name' form, got {repo_id!r}.")
+        raise HfAuthError(f"{env_name} must be a string in 'namespace/name' form, got {repo_id!r}.")
     repo_id = repo_id.strip()
     parts = repo_id.split("/")
     if len(parts) != 2 or not parts[0] or not parts[1] or any(c.isspace() for c in repo_id):
         raise HfAuthError(
-            f"HF_DATASET_REPO '{repo_id}' must be exactly 'namespace/name' (e.g. \"Cipoklean/cloakbreak-data-v1\")."
+            f"{env_name} '{repo_id}' must be exactly 'namespace/name' (e.g. \"Cipoklean/cloakbreak-data-v1\")."
         )
     namespace, name = parts
 
@@ -95,8 +95,8 @@ def validate_hf_identity(whoami: dict, repo_id: str) -> str:
     owner = whoami.get("name")
     if owner != namespace:
         raise HfAuthError(
-            f"HF_DATASET_REPO namespace '{namespace}' does not match token owner '{owner}' (case-sensitive). "
-            f"Fix: export HF_DATASET_REPO=\"{owner}/{name}\""
+            f"{env_name} namespace '{namespace}' does not match token owner '{owner}' (case-sensitive). "
+            f"Fix: export {env_name}=\"{owner}/{name}\""
         )
     return f"HF auth OK: user={owner} role={role} repo={repo_id}"
 
@@ -104,6 +104,7 @@ def validate_hf_identity(whoami: dict, repo_id: str) -> str:
 def main() -> None:
     token = os.getenv("HF_TOKEN", "").strip()
     repo_id = os.getenv("HF_DATASET_REPO", "").strip()
+    model_repo = os.getenv("HF_MODEL_REPO", "").strip()
     try:
         if not token:
             raise HfAuthError("HF_TOKEN is not set; export a Hugging Face token first.")
@@ -113,6 +114,8 @@ def main() -> None:
             )
         whoami = fetch_whoami(token)
         message = validate_hf_identity(whoami, repo_id)
+        if model_repo:
+            message += "\n" + validate_hf_identity(whoami, model_repo, env_name="HF_MODEL_REPO")
     except HfAuthError as exc:
         sys.exit(f"HF AUTH PREFLIGHT FAIL: {exc}")
     except Exception as exc:  # pragma: no cover - defensive

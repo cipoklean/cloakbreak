@@ -227,6 +227,30 @@ def _decode_hf_audio_row(audio_info: Dict) -> np.ndarray | None:
     return None
 
 
+def _inthewild_utt_id(row: Dict, idx: int) -> str:
+    """Stable InTheWild utterance id: ``notes.utterance_id`` else positional fallback."""
+    notes = json.loads(row["notes"]) if isinstance(row.get("notes"), str) else {}
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(notes.get("utterance_id") or f"itw_{idx:06d}"))
+
+
+def _export_real_clip(audio_info: Dict, wav_path: Path, min_s: float, max_s: float) -> float | None:
+    """Decode an HF audio row, duration-check it, save loudness-normalized.
+
+    Returns the clip duration in seconds, or None when the audio cannot be
+    decoded or falls outside ``[min_s, max_s]`` (nothing is written then).
+    Shared by the Session-1 builder and the Session-2 dataset restorer so the
+    re-materialized bytes are identical.
+    """
+    audio_16k = _decode_hf_audio_row(audio_info)
+    if audio_16k is None:
+        return None
+    dur = audio_16k.shape[0] / float(TARGET_SR)
+    if dur < min_s or dur > max_s:
+        return None
+    save_wav_mono(wav_path, normalize_loudness(audio_16k), TARGET_SR)
+    return dur
+
+
 def synthesize_mock_clone(ref_audio: np.ndarray, seed: int) -> np.ndarray:
     """Fast CPU synthetic waveform matched in duration & loudness for unit tests."""
     rng = np.random.default_rng(seed)
@@ -533,7 +557,7 @@ def build_from_hf_on_gpu(
             break
         notes = json.loads(row["notes"]) if isinstance(row.get("notes"), str) else {}
         speaker_id = str(notes.get("speaker") or f"itw_spk_{idx}")
-        utt_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(notes.get("utterance_id") or f"itw_{idx:06d}"))
+        utt_id = _inthewild_utt_id(row, idx)
         label = int(row["label"])
         wav_path = real_dir / f"{utt_id}.wav"
 
@@ -541,13 +565,9 @@ def build_from_hf_on_gpu(
             dur = _wav_duration_s(wav_path)
             skipped_real += 1
         else:
-            audio_16k = _decode_hf_audio_row(row["audio"])
-            if audio_16k is None:
+            dur = _export_real_clip(row["audio"], wav_path, min_duration_s, max_duration_s)
+            if dur is None:
                 continue
-            dur = audio_16k.shape[0] / float(TARGET_SR)
-            if dur < min_duration_s or dur > max_duration_s:
-                continue
-            save_wav_mono(wav_path, normalize_loudness(audio_16k), TARGET_SR)
 
         if dur < min_duration_s or dur > max_duration_s:
             continue

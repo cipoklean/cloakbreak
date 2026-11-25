@@ -567,6 +567,60 @@ def build_rolloff_matched_pair(
     return pair, summary
 
 
+def check_int8_parity(
+    manifest_path: Path,
+    fp32_runtime: DetectorRuntime,
+    int8_runtime: DetectorRuntime,
+    max_auroc_diff: float = 0.01,
+    max_clips: int | None = None,
+) -> Dict:
+    """Score the manifest ``val`` split (non-Kokoro) with FP32 vs INT8 ONNX runtimes.
+
+    Returns per-runtime EER/AUROC plus probability deltas; ``passed`` is True when
+    ``|auroc_fp32 - auroc_int8| <= max_auroc_diff``.
+    """
+    rows = _resolve_manifest_rows(manifest_path)
+    val_rows = [
+        r for r in rows
+        if r.get("split") == "val" and "kokoro" not in str(r.get("generator", ""))
+    ]
+    if not val_rows:
+        raise ValueError(
+            f"check_int8_parity requires manifest rows with split=='val' (non-Kokoro); "
+            f"{manifest_path} has none."
+        )
+    if max_clips is not None and len(val_rows) > max_clips:
+        keep = np.random.default_rng(42).permutation(len(val_rows))[: max(1, int(max_clips))]
+        val_rows = [val_rows[int(i)] for i in sorted(keep)]
+
+    labels: List[int] = []
+    fp32_scores: List[float] = []
+    int8_scores: List[float] = []
+    for i, row in enumerate(val_rows):
+        wav, sr = load_wav_mono(row["path"], target_sr=TARGET_SR)
+        degraded = degrade_for_eval(wav, condition="clean", sr=sr, seed=3000 + i)
+        labels.append(int(row["label"]))
+        fp32_scores.append(fp32_runtime.predict(degraded).spoof_prob)
+        int8_scores.append(int8_runtime.predict(degraded).spoof_prob)
+
+    m32 = compute_eer_and_auroc(labels, fp32_scores)
+    m8 = compute_eer_and_auroc(labels, int8_scores)
+    prob_diffs = np.abs(np.asarray(fp32_scores, dtype=np.float64) - np.asarray(int8_scores, dtype=np.float64))
+    auroc_diff = abs(float(m32["auroc"]) - float(m8["auroc"]))
+    return {
+        "num_clips": len(val_rows),
+        "num_real": int(sum(1 for v in labels if v == 0)),
+        "num_spoof": int(sum(1 for v in labels if v == 1)),
+        "fp32": {"auroc": m32["auroc"], "eer_pct": m32["eer_pct"]},
+        "int8": {"auroc": m8["auroc"], "eer_pct": m8["eer_pct"]},
+        "auroc_abs_diff": round(auroc_diff, 6),
+        "mean_abs_prob_diff": round(float(prob_diffs.mean()), 6) if prob_diffs.size else 0.0,
+        "max_abs_prob_diff": round(float(prob_diffs.max()), 6) if prob_diffs.size else 0.0,
+        "max_auroc_diff": float(max_auroc_diff),
+        "passed": bool(auroc_diff <= float(max_auroc_diff)),
+    }
+
+
 def save_audit_json(audit: Dict, results_dir: Path, kind: str, manifest_path: Path) -> Path:
     """Persist an audit JSON under ``results/{kind}_{manifest_parent}_{UTC ts}.json``."""
     results_dir = Path(results_dir)
@@ -652,7 +706,7 @@ def run_evaluation(
     slices: Dict[str, Dict] = {
         "shortcut_audit": run_shortcut_audit(manifest_path, max_per_split=max_per_slice),
     }
-    for cond in ("clean", "opus_16k", "phone_8k", "noise_5db", "short_0.5s", "short_0.8s"):
+    for cond in ("clean", "opus_16k", "phone_8k", "noise_10db", "noise_5db", "short_0.5s", "short_0.8s"):
         slices[f"test_{cond}"] = evaluate_slice(main_pair, detector, condition=cond, baseline=baseline)
     if kokoro_all_pair:
         slices["unseen_kokoro_clean"] = evaluate_slice(kokoro_all_pair, detector, condition="clean", baseline=baseline)
@@ -704,7 +758,16 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max-per-slice", type=int, default=600)
     parser.add_argument("--out-json", type=Path, default=Path("eval/results.json"))
+    parser.add_argument("--out-markdown", type=Path, default=None,
+                        help="Also write the markdown results table (with backend/model/baseline header) here")
     parser.add_argument("--results-dir", type=Path, default=Path("results"))
+    parser.add_argument("--int8-parity", action="store_true",
+                        help="Score val split with --fp32-model vs --model-path ONNX and check AUROC parity")
+    parser.add_argument("--fp32-model", type=Path, default=None, help="FP32 ONNX path for --int8-parity")
+    parser.add_argument("--max-auroc-diff", type=float, default=0.01, help="INT8 parity AUROC tolerance")
+    parser.add_argument("--parity-max-clips", type=int, default=None, help="Cap val clips for --int8-parity")
+    parser.add_argument("--onnx-threads", type=int, default=min(os.cpu_count() or 2, 8),
+                        help="ONNX intra-op threads for --int8-parity")
     parser.add_argument("--shortcut-only", action="store_true", help="Run only acoustic shortcut audit & disjoint check")
     parser.add_argument(
         "--augment-train-windows",
@@ -753,6 +816,32 @@ def main() -> None:
                 sys.exit(2)
         return
 
+    if args.int8_parity:
+        if args.fp32_model is None:
+            raise SystemExit("--fp32-model is required for --int8-parity")
+        if args.model_path is None:
+            raise SystemExit("--model-path (INT8 ONNX) is required for --int8-parity")
+        fp32_rt = OnnxDetectorRuntime(args.fp32_model, num_threads=args.onnx_threads)
+        int8_rt = OnnxDetectorRuntime(args.model_path, num_threads=args.onnx_threads)
+        parity = check_int8_parity(
+            args.manifest,
+            fp32_rt,
+            int8_rt,
+            max_auroc_diff=args.max_auroc_diff,
+            max_clips=args.parity_max_clips,
+        )
+        verdict = "PASS" if parity["passed"] else "FAIL"
+        print(
+            f"[int8 parity] fp32 AUROC={parity['fp32']['auroc']:.4f} "
+            f"int8 AUROC={parity['int8']['auroc']:.4f} "
+            f"|diff|={parity['auroc_abs_diff']:.4f} (max {parity['max_auroc_diff']:.4f}) {verdict}",
+            flush=True,
+        )
+        save_audit_json(parity, args.results_dir, "int8_parity", args.manifest)
+        if not parity["passed"]:
+            sys.exit(4)
+        return
+
     if args.backend == "mock":
         detector: DetectorRuntime = MockDetectorRuntime()
     elif args.backend == "onnx":
@@ -776,7 +865,18 @@ def main() -> None:
     print("=== Shortcut Audit (Duration + RMS + SNR + Spectral Rolloff) ===")
     print(json.dumps(results["shortcut_audit"], indent=2))
     print("\n=== Benchmark Table ===")
-    print(format_markdown_table(results))
+    md_table = format_markdown_table(results)
+    print(md_table)
+    if args.out_markdown is not None:
+        args.out_markdown.parent.mkdir(parents=True, exist_ok=True)
+        header = [
+            f"backend: {detector.backend_name}",
+            f"model: {args.model_path if args.model_path is not None else 'n/a'}",
+            f"baseline: {args.baseline_id if args.baseline_id else 'none'}",
+            "",
+        ]
+        args.out_markdown.write_text("\n".join(header) + md_table + "\n", encoding="utf-8")
+        print(f"[eval] wrote markdown table -> {args.out_markdown}")
 
 
 if __name__ == "__main__":
