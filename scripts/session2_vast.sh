@@ -25,6 +25,9 @@ set -euo pipefail
 #   DRY_RUN=1 / --dry-run    no HF token needed, cpu device, verify-only restore,
 #                            --tiny-test model, dry-run artifact upload plan
 #   SMOKE=1                  small ckpt/results dirs + smoke_check/ HF prefix
+#   SMOKE_MAX_MIN=10         wall-clock cap (minutes) for SMOKE steps 3-7; the
+#                            smoke clock starts AFTER shared setup steps 1-2
+#                            (deps/preflight + dataset restore). On cap: exit 5.
 #   RESUME=auto|none|path    checkpoint resume spec (default auto)
 #   EXPECTED_MANIFEST_ROWS=N hard-check manifest row count after restore
 #   VAST_RATE_PER_HR=X       prints projected training cost in [eta] lines
@@ -35,10 +38,10 @@ set -euo pipefail
 #                          baseline HF id (default Vansh180/deepfake-audio-wav2vec2,
 #                          empty in DRY_RUN), INT8-vs-FP32 AUROC tolerance (0.01)
 #
-# Run INSIDE tmux so SSH drops on mobile data never kill progress:
-#   tmux new -s cb2
+# Vast auto-starts a tmux session when you SSH in — run the script inside it so
+# SSH drops on mobile data never kill progress:
 #   bash scripts/session2_vast.sh
-# Reattach after disconnect:  tmux attach -t cb2
+# After a reconnect:  tmux attach
 # =============================================================================
 
 set +x
@@ -73,6 +76,11 @@ RESUME="${RESUME:-auto}"
 EXPECTED_MANIFEST_ROWS="${EXPECTED_MANIFEST_ROWS:-}"
 VAST_RATE_PER_HR="${VAST_RATE_PER_HR:-}"
 SKIP_DEPS="${SKIP_DEPS:-0}"
+SMOKE_MAX_MIN="${SMOKE_MAX_MIN:-10}"
+SMOKE_CLOCK_START=0
+SMOKE_DEADLINE=0
+SMOKE_SETUP_MIN="0.0"
+TRAIN_CMD_DEADLINE=""
 
 if [ "$DRY_RUN" = "1" ]; then
   DEVICE="cpu"
@@ -94,9 +102,11 @@ GATE_MAX_PER_SLICE=1000; [ "$SMOKE" = "1" ] && GATE_MAX_PER_SLICE=100
 EVAL_MAX_PER_SLICE=600; [ "$SMOKE" = "1" ] && EVAL_MAX_PER_SLICE=20
 
 if [ -z "${TMUX:-}" ] && [ "${ALLOW_NO_TMUX:-0}" != "1" ]; then
-  echo "ERROR: Run this script inside tmux so mobile SSH drops cannot kill paid GPU work."
-  echo "  1. tmux new -s cb2"
+  echo "ERROR: Run this script inside the tmux session Vast opens on SSH login"
+  echo "  (so mobile SSH drops cannot kill paid GPU work)."
+  echo "  1. SSH into the instance (Vast auto-starts tmux for you)"
   echo "  2. bash scripts/session2_vast.sh"
+  echo "  After a reconnect run: tmux attach"
   echo "(Override only if needed with ALLOW_NO_TMUX=1)"
   exit 1
 fi
@@ -104,6 +114,156 @@ fi
 mkdir -p "$LOG_DIR" "$RESULTS_DIR" "$CKPT_DIR"
 export HF_DATASET_REPO HF_MODEL_REPO
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+
+# Grep-able [KEY] summary lines: printed to the log AND appended to
+# $RESULTS_DIR/key_lines.txt (uploaded with results/ by step 7 / budget stop).
+# The file is append-only so reruns accumulate lines across invocations.
+KEY_LINES_FILE="$RESULTS_DIR/key_lines.txt"
+export CB_KEY_LINES_FILE="$KEY_LINES_FILE"
+
+key_line() {
+  local line="[KEY] $*"
+  echo "$line"
+  echo "$line" >> "$KEY_LINES_FILE"
+}
+
+smoke_min_fields() {
+  # Prints "used_min=<u.u> cap_min=<c.c> setup_min=<s.s>" for the smoke clock.
+  local now_s used cap
+  now_s="$(date +%s)"
+  used="$(awk "BEGIN{printf \"%.1f\", ($now_s - $SMOKE_CLOCK_START)/60.0}")"
+  cap="$(awk "BEGIN{printf \"%.1f\", $SMOKE_MAX_MIN}")"
+  echo "used_min=$used cap_min=$cap setup_min=$SMOKE_SETUP_MIN"
+}
+
+smoke_stop() {
+  # $1 = step number where the cap hit. Exit 5: no upload, no SMOKE COMPLETE.
+  key_line "smoke $(smoke_min_fields) complete=false"
+  echo "[smoke] TIME CAP REACHED at step $1 — smoke did NOT complete; inspect the log before the full run"
+  exit 5
+}
+
+run_capped() {
+  # $1 = step number; remaining args = command. In SMOKE mode wraps the command
+  # in `timeout --kill-after=30 <seconds until SMOKE_DEADLINE>`; a <=0 remaining
+  # budget or a 124/137 timeout becomes a smoke cap stop (exit 5).
+  local step_no="$1"; shift
+  if [ "$SMOKE" != "1" ]; then
+    "$@"
+    return $?
+  fi
+  local remaining rc=0
+  remaining=$(( SMOKE_DEADLINE - $(date +%s) ))
+  if [ "$remaining" -le 0 ]; then
+    smoke_stop "$step_no"
+  fi
+  timeout --kill-after=30 "$remaining" "$@" || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    smoke_stop "$step_no"
+  fi
+  return "$rc"
+}
+
+emit_gate_key() {
+  # [KEY] gate augmented_auroc=<a> eer=<e> pass=<bool> from newest audit JSON.
+  local f
+  f="$(ls -t "$RESULTS_DIR"/shortcut_audit_augmented_*.json 2>/dev/null | head -1 || true)"
+  [ -z "$f" ] && return 0
+  "$PYTHON" - "$f" <<'PY' || true
+import json, os, sys
+
+d = json.load(open(sys.argv[1]))
+aug = d.get("augmented_train_window_shortcuts") or {}
+
+def _fmt(v, nd):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "NA"
+    if f != f:
+        return "NA"
+    return f"{f:.{nd}f}"
+
+auroc, eer, warn = aug.get("auroc"), aug.get("eer_pct"), aug.get("shortcut_warning")
+if auroc is None or eer is None:
+    sys.exit(0)
+line = (f"[KEY] gate augmented_auroc={_fmt(auroc, 4)} eer={_fmt(eer, 2)} "
+        f"pass={'false' if warn else 'true'}")
+print(line)
+kf = os.environ.get("CB_KEY_LINES_FILE", "").strip()
+if kf:
+    with open(kf, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+PY
+}
+
+emit_int8_key() {
+  # [KEY] int8_parity fp32_auroc=<a> int8_auroc=<b> delta=<d> from newest parity JSON.
+  local f
+  f="$(ls -t "$RESULTS_DIR"/int8_parity_*.json 2>/dev/null | head -1 || true)"
+  [ -z "$f" ] && return 0
+  "$PYTHON" - "$f" <<'PY' || true
+import json, os, sys
+
+d = json.load(open(sys.argv[1]))
+f32, i8 = d.get("fp32") or {}, d.get("int8") or {}
+
+def _fmt(v, nd=4):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "NA"
+    if f != f:
+        return "NA"
+    return f"{f:.{nd}f}"
+
+if f32.get("auroc") is None or i8.get("auroc") is None:
+    sys.exit(0)
+line = (f"[KEY] int8_parity fp32_auroc={_fmt(f32['auroc'])} "
+        f"int8_auroc={_fmt(i8['auroc'])} delta={_fmt(d.get('auroc_abs_diff'))}")
+print(line)
+kf = os.environ.get("CB_KEY_LINES_FILE", "").strip()
+if kf:
+    with open(kf, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+PY
+}
+
+emit_headline_key() {
+  # [KEY] headline unseen_kokoro_opus16k eer=<e> auroc=<a> baseline_eer=<b|NA>
+  # from $RESULTS_DIR/eval_results.json.
+  local f="$RESULTS_DIR/eval_results.json"
+  [ -f "$f" ] || return 0
+  "$PYTHON" - "$f" <<'PY' || true
+import json, os, sys
+
+d = json.load(open(sys.argv[1]))
+sl = d.get("unseen_kokoro_opus_16k") or {}
+cb = sl.get("cloakbreak") or {}
+bl = sl.get("baseline") or {}
+
+def _fmt(v, nd):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "NA"
+    if f != f:
+        return "NA"
+    return f"{f:.{nd}f}"
+
+eer, auroc = cb.get("eer_pct"), cb.get("auroc")
+if eer is None or auroc is None:
+    sys.exit(0)
+be = _fmt(bl.get("eer_pct"), 2) if bl.get("eer_pct") is not None else "NA"
+line = (f"[KEY] headline unseen_kokoro_opus16k eer={_fmt(eer, 2)} "
+        f"auroc={_fmt(auroc, 4)} baseline_eer={be}")
+print(line)
+kf = os.environ.get("CB_KEY_LINES_FILE", "").strip()
+if kf:
+    with open(kf, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+PY
+}
 
 # Session clock: epoch of FIRST launch on this box; reruns reuse it so the
 # MAX_HOURS budget spans preemptions/restarts.
@@ -222,11 +382,24 @@ else
   echo "[step 2/8] Dataset already restored ($LOG_DIR/.s2_data_done) — skipping."
 fi
 
+# Smoke wall-clock: starts AFTER shared setup (steps 1-2) so deps/restore time —
+# which the full run reuses via markers — does not count against the smoke cap.
+TRAIN_CMD_DEADLINE="$TRAIN_DEADLINE"
+if [ "$SMOKE" = "1" ]; then
+  SMOKE_CLOCK_START="$(date +%s)"
+  SMOKE_SETUP_MIN="$(awk "BEGIN{printf \"%.1f\", ($SMOKE_CLOCK_START - $INVOCATION_START)/60.0}")"
+  SMOKE_DEADLINE=$(( SMOKE_CLOCK_START + $(awk "BEGIN{print int($SMOKE_MAX_MIN*60)}") ))
+  if [ "$SMOKE_DEADLINE" -lt "$TRAIN_CMD_DEADLINE" ]; then
+    TRAIN_CMD_DEADLINE="$SMOKE_DEADLINE"
+  fi
+  echo "[smoke] wall-clock cap ${SMOKE_MAX_MIN} min started at $(date -u -d "@$SMOKE_CLOCK_START" '+%Y-%m-%d %H:%M:%S UTC') (setup steps 1-2 took ${SMOKE_SETUP_MIN} min)"
+fi
+
 # ---- step 3: augmented-window shortcut gate (before any GPU training) --------
 if [ ! -f "$LOG_DIR/${MP}_gate_done" ]; then
   echo "[step 3/8] Running augmented shortcut audit gate (trivial classifier must stay < 0.60 AUROC)..."
   set +e
-  "$PYTHON" -m src.eval \
+  run_capped 3 "$PYTHON" -m src.eval \
     --shortcut-only \
     --augment-train-windows \
     --fail-on-shortcut \
@@ -237,12 +410,14 @@ if [ ! -f "$LOG_DIR/${MP}_gate_done" ]; then
   set -e
   if [ "$gate_rc" -ne 0 ]; then
     if [ "$gate_rc" -eq 2 ]; then
+      emit_gate_key
       echo "[step 3] GATE FAILED: trivial classifier still finds a shortcut on augmented training windows (see the [augmented audit] line above and $RESULTS_DIR/shortcut_audit_augmented_*.json). Stopping before training — no GPU training time spent."
       exit 2
     fi
     echo "[step 3] shortcut audit failed with rc=$gate_rc"
     exit "$gate_rc"
   fi
+  emit_gate_key
   latest_audit="$(ls -t "$RESULTS_DIR"/shortcut_audit_augmented_*.json 2>/dev/null | head -1 || true)"
   if [ -n "$latest_audit" ]; then
     "$PYTHON" - "$latest_audit" <<'PY'
@@ -260,14 +435,14 @@ fi
 
 # ---- step 4: train (per-epoch last.pt + HF upload + resume + deadline guard) --
 if [ ! -f "$LOG_DIR/${MP}_train_done" ]; then
-  echo "[step 4/8] Training (resume-from=${RESUME}, deadline_unix=${TRAIN_DEADLINE}, hf-prefix=${HF_PREFIX})..."
+  echo "[step 4/8] Training (resume-from=${RESUME}, deadline_unix=${TRAIN_CMD_DEADLINE}, hf-prefix=${HF_PREFIX})..."
   train_args=(
     --manifest "$DATA_DIR/manifest.jsonl"
     --out-dir "$CKPT_DIR"
     --device "$DEVICE"
     --resume-from "$RESUME"
     --hf-prefix "$HF_PREFIX"
-    --deadline-unix "$TRAIN_DEADLINE"
+    --deadline-unix "$TRAIN_CMD_DEADLINE"
   )
   if [ "$DRY_RUN" != "1" ] && [ -n "$HF_MODEL_REPO" ]; then
     train_args+=(--hf-repo "$HF_MODEL_REPO")
@@ -283,10 +458,16 @@ if [ ! -f "$LOG_DIR/${MP}_train_done" ]; then
     train_args+=(--tiny-test)
   fi
   set +e
-  "$PYTHON" -m src.train "${train_args[@]}"
+  run_capped 4 "$PYTHON" -m src.train "${train_args[@]}"
   train_rc=$?
   set -e
   if [ "$train_rc" -eq 3 ]; then
+    # In SMOKE the train deadline is min(MAX_HOURS train deadline, smoke cap):
+    # rc 3 past the smoke deadline is a smoke cap stop (exit 5); otherwise it is
+    # the session budget guard -> clean stop (exit 0).
+    if [ "$SMOKE" = "1" ] && [ "$(date +%s)" -ge "$SMOKE_DEADLINE" ]; then
+      smoke_stop 4
+    fi
     budget_stop
   fi
   if [ "$train_rc" -ne 0 ]; then
@@ -312,7 +493,7 @@ if [ ! -f "$LOG_DIR/${MP}_parity_done" ]; then
     if [ "$DRY_RUN" = "1" ]; then
       export_args+=(--tiny-test)
     fi
-    "$PYTHON" -m src.train "${export_args[@]}"
+    run_capped 5 "$PYTHON" -m src.train "${export_args[@]}"
   fi
   parity_args=(
     --int8-parity
@@ -326,9 +507,10 @@ if [ ! -f "$LOG_DIR/${MP}_parity_done" ]; then
     parity_args+=(--parity-max-clips 100)
   fi
   set +e
-  "$PYTHON" -m src.eval "${parity_args[@]}"
+  run_capped 5 "$PYTHON" -m src.eval "${parity_args[@]}"
   parity_rc=$?
   set -e
+  emit_int8_key
   if [ "$parity_rc" -ne 0 ]; then
     echo "[step 5] INT8 parity check FAILED (rc=$parity_rc) — see $RESULTS_DIR/int8_parity_*.json"
     exit "$parity_rc"
@@ -356,15 +538,22 @@ if [ ! -f "$LOG_DIR/${MP}_eval_done" ]; then
   if [ -n "$BASELINE_ID" ]; then
     eval_args+=(--baseline-id "$BASELINE_ID")
   fi
-  "$PYTHON" -m src.eval "${eval_args[@]}"
+  run_capped 6 "$PYTHON" -m src.eval "${eval_args[@]}"
   echo "----- results_table.md -----"
   cat "$RESULTS_DIR/results_table.md"
+  emit_headline_key
   touch "$LOG_DIR/${MP}_eval_done"
 else
   echo "[step 6/8] Full eval already completed ($LOG_DIR/${MP}_eval_done) — skipping."
 fi
 
 check_budget
+
+# SMOKE completed all capped steps — record it BEFORE upload so key_lines.txt
+# (which lives in RESULTS_DIR) is uploaded together with the results.
+if [ "$SMOKE" = "1" ]; then
+  key_line "smoke $(smoke_min_fields) complete=true"
+fi
 
 # ---- step 7: upload artifacts to the private model repo ----------------------
 if [ ! -f "$LOG_DIR/${MP}_upload_done" ]; then
@@ -380,7 +569,7 @@ if [ ! -f "$LOG_DIR/${MP}_upload_done" ]; then
   if [ "$DRY_RUN" = "1" ]; then
     upload_args+=(--dry-run)
   fi
-  "$PYTHON" -m src.hub "${upload_args[@]}"
+  run_capped 7 "$PYTHON" -m src.hub "${upload_args[@]}"
   touch "$LOG_DIR/${MP}_upload_done"
 else
   echo "[step 7/8] Artifact upload already completed ($LOG_DIR/${MP}_upload_done) — skipping."
@@ -397,6 +586,7 @@ fmt_hms() {
 echo "================================================================="
 if [ "$SMOKE" = "1" ]; then
   echo "[session2] SMOKE COMPLETE — now run the full session: bash scripts/session2_vast.sh"
+  echo "[smoke] used $(awk "BEGIN{printf \"%.1f\", ($(date +%s) - $SMOKE_CLOCK_START)/60.0}") of $(awk "BEGIN{printf \"%.1f\", $SMOKE_MAX_MIN}") budget minutes (setup steps 1–2: ${SMOKE_SETUP_MIN} min, shared with the full run)"
 else
   echo "[session2] ALL STEPS COMPLETE"
 fi
@@ -404,6 +594,10 @@ echo "[session2] This invocation: $(fmt_hms "$INVOCATION_SEC") | since session s
 if [ -n "$VAST_RATE_PER_HR" ]; then
   COST="$(awk "BEGIN{printf \"%.2f\", ($SESSION_SEC/3600.0)*$VAST_RATE_PER_HR}")"
   echo "[session2] Estimated cost since session start: \$${COST} at \$${VAST_RATE_PER_HR}/hr"
+fi
+echo "----- [KEY] lines ($KEY_LINES_FILE) -----"
+if [ -f "$KEY_LINES_FILE" ]; then
+  cat "$KEY_LINES_FILE"
 fi
 echo "[session2] DESTROY this Vast instance now (Destroy, not Stop)."
 echo "================================================================="

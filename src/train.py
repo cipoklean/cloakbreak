@@ -194,6 +194,7 @@ def train_model(
     resume_from: Path | None = None,
     deadline_unix: float | None = None,
     checkpoint_callback: Callable[[List[Path], Dict], None] | None = None,
+    eta_after_steps: int = 50,
 ) -> Dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(device_str if (device_str != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -440,7 +441,7 @@ def train_model(
                         stage_name, ep, global_steps, time.time() - train_t0, uploaded=uploaded_ok
                     )
 
-                if stage_steps == 50 and not eta_printed:
+                if stage_steps == eta_after_steps and not eta_printed:
                     eta_printed = True
                     ep_elapsed = max(time.perf_counter() - t_ep, 1e-6)
                     sps = steps / ep_elapsed
@@ -468,16 +469,32 @@ def train_model(
                             flush=True,
                         )
                     rate_env = os.environ.get("VAST_RATE_PER_HR", "").strip()
+                    rate_val: float | None = None
                     if rate_env:
                         try:
-                            rate = float(rate_env)
+                            rate_val = float(rate_env)
                             print(
-                                f"[eta] projected training cost ~${(eta_sec / 3600.0) * rate:.2f} "
-                                f"at ${rate:.2f}/hr",
+                                f"[eta] projected training cost ~${(eta_sec / 3600.0) * rate_val:.2f} "
+                                f"at ${rate_val:.2f}/hr",
                                 flush=True,
                             )
                         except ValueError:
-                            pass
+                            rate_val = None
+                    cost_str = f"${(eta_sec / 3600.0) * rate_val:.2f}" if rate_val is not None else "NA"
+                    key_line = (
+                        f"[KEY] eta stage={stage_name} steps_per_s={sps:.2f} "
+                        f"train_eta_min={eta_sec / 60.0:.1f} projected_cost={cost_str}"
+                    )
+                    print(key_line, flush=True)
+                    key_file = os.environ.get("CB_KEY_LINES_FILE", "").strip()
+                    if key_file:
+                        try:
+                            key_path = Path(key_file)
+                            key_path.parent.mkdir(parents=True, exist_ok=True)
+                            with key_path.open("a", encoding="utf-8") as fh:
+                                fh.write(key_line + "\n")
+                        except OSError as exc:
+                            print(f"[warn] could not append KEY line to {key_file}: {exc}", flush=True)
             if steps == 0:
                 break
             scheduler.step()

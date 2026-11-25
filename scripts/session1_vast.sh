@@ -20,20 +20,20 @@ set -euo pipefail
 # HF auth (token role + namespace) is verified every run before Step 1 via
 # scripts/hf_auth_check.py (stdlib-only, safe before deps are installed).
 #
-# Run INSIDE tmux so SSH drops on mobile data never kill progress:
-#   tmux new -s cb
+# Vast auto-starts a tmux session when you SSH in — run the script inside it so
+# SSH drops on mobile data never kill progress:
 #   bash scripts/session1_vast.sh
-# Reattach after disconnect:
-#   tmux attach -t cb
+# After a reconnect:  tmux attach
 # =============================================================================
 
 set +x
 
 if [ -z "${TMUX:-}" ] && [ "${ALLOW_NO_TMUX:-0}" != "1" ]; then
-  echo "ERROR: Run this script inside tmux so mobile SSH drops cannot kill paid GPU work."
-  echo "  1. apt-get update -qq && apt-get install -y -qq tmux  (if tmux is missing)"
-  echo "  2. tmux new -s cb"
-  echo "  3. bash scripts/session1_vast.sh"
+  echo "ERROR: Run this script inside the tmux session Vast opens on SSH login"
+  echo "  (so mobile SSH drops cannot kill paid GPU work)."
+  echo "  1. SSH into the instance (Vast auto-starts tmux for you)"
+  echo "  2. bash scripts/session1_vast.sh"
+  echo "  After a reconnect run: tmux attach"
   echo "(Override only if needed with ALLOW_NO_TMUX=1)"
   exit 1
 fi

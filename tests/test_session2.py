@@ -523,7 +523,12 @@ def test_session2_script_static() -> None:
         assert needle in text, needle
 
 
-def _run_session2_dry_run(s2_dataset: tuple[Path, Path], tmp_path: Path, max_hours: str | None = None):
+def _run_session2_dry_run(
+    s2_dataset: tuple[Path, Path],
+    tmp_path: Path,
+    max_hours: str | None = None,
+    extra_env: dict | None = None,
+):
     data_dir, _ = s2_dataset
     log_dir = tmp_path / "s2logs"
     ckpt_dir = tmp_path / "s2ckpt"
@@ -544,6 +549,8 @@ def _run_session2_dry_run(s2_dataset: tuple[Path, Path], tmp_path: Path, max_hou
     })
     if max_hours is not None:
         env["MAX_HOURS"] = max_hours
+    if extra_env:
+        env.update(extra_env)
     proc = subprocess.run(
         ["bash", "scripts/session2_vast.sh", "--dry-run", "--max-steps", "4"],
         cwd=REPO_ROOT,
@@ -568,6 +575,41 @@ def test_session2_dry_run_end_to_end(s2_dataset: tuple[Path, Path], tmp_path: Pa
     assert "Floor: trivial 4-feature logistic" in table
     assert "DRY RUN upload plan" in out or "upload plan" in out
     assert (log_dir / "session2.log").exists()
+
+    # Grep-able [KEY] lines: stdout + persisted key_lines.txt.
+    assert "[KEY] gate augmented_auroc=" in out
+    assert "[KEY] int8_parity fp32_auroc=" in out
+    assert "[KEY] headline unseen_kokoro_opus16k eer=" in out
+    assert "[KEY] smoke used_min=" in out and "complete=true" in out
+    assert "[smoke] used" in out
+    key_lines = results_dir / "key_lines.txt"
+    assert key_lines.exists()
+    content = key_lines.read_text()
+    for needle in (
+        "[KEY] gate augmented_auroc=",
+        "[KEY] int8_parity fp32_auroc=",
+        "[KEY] headline unseen_kokoro_opus16k eer=",
+        "[KEY] smoke used_min=",
+    ):
+        assert needle in content, needle
+    import re
+
+    assert re.search(
+        r"^\[KEY\] gate augmented_auroc=\d+\.\d{4} eer=\d+\.\d{2} pass=(true|false)$",
+        content, re.M,
+    )
+    assert re.search(
+        r"^\[KEY\] int8_parity fp32_auroc=\d+\.\d{4} int8_auroc=\d+\.\d{4} delta=\d+\.\d{4}$",
+        content, re.M,
+    )
+    assert re.search(
+        r"^\[KEY\] headline unseen_kokoro_opus16k eer=\d+\.\d{2} auroc=\d+\.\d{4} baseline_eer=(\d+\.\d{2}|NA)$",
+        content, re.M,
+    )
+    assert re.search(
+        r"^\[KEY\] smoke used_min=\d+\.\d cap_min=\d+\.\d setup_min=\d+\.\d complete=true$",
+        content, re.M,
+    )
     # Nothing leaked into the repo working dirs.
     for stray in (
         REPO_ROOT / "data" / "cloakbreak_v1",
@@ -606,3 +648,61 @@ def test_session2_dry_run_budget_stop(s2_dataset: tuple[Path, Path], tmp_path: P
     assert "[budget] STOPPED CLEANLY" in out
     assert "ALL STEPS COMPLETE" not in out
     assert "SMOKE COMPLETE" not in out
+
+
+def test_session2_dry_run_smoke_max_min_zero(s2_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    fresh = tmp_path / "smoke_cap_run"
+    fresh.mkdir()
+    proc, *_ = _run_session2_dry_run(s2_dataset, fresh, extra_env={"SMOKE_MAX_MIN": "0"})
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 5, out[-5000:]
+    assert "complete=false" in out
+    assert "TIME CAP REACHED" in out
+    assert "SMOKE COMPLETE" not in out
+
+
+def test_train_eta_key_line(s2_dataset: tuple[Path, Path], tmp_path: Path, monkeypatch, capsys) -> None:
+    import re
+
+    _, manifest = s2_dataset
+    key_file = tmp_path / "key_lines.txt"
+    monkeypatch.setenv("CB_KEY_LINES_FILE", str(key_file))
+    monkeypatch.delenv("VAST_RATE_PER_HR", raising=False)
+
+    train_model(
+        **_train_kwargs(
+            manifest, tmp_path / "ckpt_eta", epochs_stage1=1, epochs_stage2=0,
+            batch_size=8, precompute_opus=False, eta_after_steps=2,
+        )
+    )
+    out = capsys.readouterr().out
+    na_re = re.compile(
+        r"^\[KEY\] eta stage=stage1_head steps_per_s=[0-9.]+ train_eta_min=[0-9.]+ projected_cost=NA$",
+        re.M,
+    )
+    assert na_re.search(out), out[-3000:]
+    assert key_file.exists()
+    content = key_file.read_text()
+    assert na_re.search(content)
+
+    # With a rate set, projected_cost becomes a dollar amount.
+    key_file2 = tmp_path / "key_lines2.txt"
+    monkeypatch.setenv("CB_KEY_LINES_FILE", str(key_file2))
+    monkeypatch.setenv("VAST_RATE_PER_HR", "0.20")
+    capsys.readouterr()
+    train_model(
+        **_train_kwargs(
+            manifest, tmp_path / "ckpt_eta2", epochs_stage1=1, epochs_stage2=0,
+            batch_size=8, precompute_opus=False, eta_after_steps=2,
+        )
+    )
+    out2 = capsys.readouterr().out
+    cost_re = re.compile(r"projected_cost=\$[0-9]+\.[0-9]{2}")
+    assert cost_re.search(out2), out2[-3000:]
+    assert cost_re.search(key_file2.read_text())
+
+
+def test_no_tmux_new_in_scripts() -> None:
+    for p in (REPO_ROOT / "scripts").rglob("*"):
+        if p.is_file():
+            assert "tmux new" not in p.read_text(errors="ignore"), p
