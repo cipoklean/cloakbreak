@@ -6,8 +6,10 @@
   <title>CloakBreak — Live Voice Deepfake Shield</title>
   <style>
     :root {
+      color-scheme: dark;
       --bg: #0c0e12;
       --panel: #151922;
+      --panel-2: #0b0d11;
       --border: #262c3a;
       --text: #e6e9ef;
       --muted: #8b95a7;
@@ -15,84 +17,179 @@
       --warn: #f59e0b;
       --danger: #ef4444;
       --accent: #38bdf8;
+      --banner-real-bg: #14532d;
+      --banner-real-fg: #dcfce7;
+      --banner-clone-bg: #7f1d1d;
+      --banner-clone-fg: #fee2e2;
+      --banner-muted-bg: #1f2430;
+      --banner-muted-fg: #cbd5e1;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      padding: 24px;
+      padding: 24px 20px 40px;
       background: var(--bg);
       color: var(--text);
-      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-size: 15px;
       line-height: 1.5;
     }
-    .wrap { max-width: 960px; margin: 0 auto; }
+    .wrap { max-width: 1040px; margin: 0 auto; }
     header {
       display: flex;
       justify-content: space-between;
-      align-items: baseline;
+      align-items: flex-start;
       flex-wrap: wrap;
       gap: 12px;
       border-bottom: 1px solid var(--border);
-      padding-bottom: 14px;
+      padding-bottom: 16px;
       margin-bottom: 20px;
     }
-    h1 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
+    h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
+    .tagline { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
     .badge {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
       font-size: 12px;
-      padding: 4px 10px;
+      padding: 4px 12px;
       border: 1px solid var(--border);
-      border-radius: 4px;
+      border-radius: 6px;
       color: var(--accent);
       background: var(--panel);
+      white-space: nowrap;
     }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 16px;
-      margin-bottom: 16px;
-    }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-    }
-    .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
-    .score { font-size: 36px; font-weight: 700; margin: 6px 0; }
-    .bar-track {
-      height: 10px;
-      background: #0b0d11;
-      border-radius: 4px;
-      overflow: hidden;
-      border: 1px solid var(--border);
-    }
-    .bar-fill { height: 100%; width: 0%; transition: width 120ms linear, background 120ms linear; background: var(--safe); }
-    .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+
+    .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
+    .ctl-label { font-size: 13px; color: var(--muted); }
     button, select, input[type="file"], input[type="text"], input[type="password"] {
       background: var(--panel);
       color: var(--text);
       border: 1px solid var(--border);
       border-radius: 6px;
-      padding: 8px 14px;
+      padding: 8px 12px;
       font-family: inherit;
-      font-size: 13px;
+      font-size: 14px;
     }
-    button { cursor: pointer; }
+    button { cursor: pointer; font-weight: 500; }
     button.primary { background: #1d4ed8; border-color: #2563eb; color: #fff; }
     button.danger { background: #991b1b; border-color: #dc2626; color: #fff; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    canvas {
+    select { min-width: 220px; }
+    input[type="file"] { padding: 4px 12px; font-size: 13px; max-width: 100%; }
+    input[type="file"]::file-selector-button {
+      background: var(--panel-2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 4px 8px;
+      font: inherit;
+      font-size: 12px;
+      margin-right: 8px;
+      cursor: pointer;
+    }
+    input::placeholder { color: var(--muted); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+    .banner {
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      padding: 20px 24px;
+      margin-bottom: 16px;
+      background: var(--banner-muted-bg);
+      color: var(--banner-muted-fg);
+      transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+    }
+    .banner.real { background: var(--banner-real-bg); color: var(--banner-real-fg); border-color: #166534; }
+    .banner.clone { background: var(--banner-clone-bg); color: var(--banner-clone-fg); border-color: #991b1b; }
+    .banner-text {
+      font-size: clamp(40px, 9vw, 72px);
+      font-weight: 600;
+      line-height: 1.05;
+      letter-spacing: -0.015em;
+    }
+    .banner-fresh {
+      margin-top: 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 13px;
+      opacity: 0.85;
+      min-height: 1em;
+    }
+
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .card-title { margin: 0; font-size: 15px; font-weight: 600; }
+    .card-verdict { font-size: 15px; font-weight: 500; }
+    .score {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 40px;
+      font-weight: 600;
+      line-height: 1;
+    }
+    .score-cap { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .bar-track {
+      position: relative;
+      height: 10px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      position: absolute;
+      inset: 0;
       width: 100%;
-      height: 180px;
+      transform: scaleX(0);
+      transform-origin: left center;
+      background: var(--safe);
+      transition: transform 120ms ease, background-color 120ms ease;
+    }
+    .bar-tick {
+      position: absolute;
+      top: -1px;
+      bottom: -1px;
+      width: 0;
+      border-left: 2px dashed rgba(230, 233, 239, 0.7);
+      transform: translateX(-1px);
+      pointer-events: none;
+    }
+    .win-line { font-size: 13px; color: var(--muted); }
+    .meta { display: flex; flex-wrap: wrap; gap: 4px 16px; font-size: 13px; color: var(--muted); }
+    .meta .k { color: var(--muted); }
+    .meta .v {
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .model-id { overflow-wrap: anywhere; }
+    canvas.spark, canvas.attn {
+      width: 100%;
       display: block;
-      background: #090b0f;
+      background: var(--panel-2);
       border: 1px solid var(--border);
       border-radius: 6px;
     }
-    .caption { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    canvas.spark { height: 96px; }
+    canvas.attn { height: 170px; }
+    .caption { font-size: 12px; color: var(--muted); }
     .hidden { display: none; }
-    .meta-row { display: flex; gap: 20px; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-top: 8px; }
-    .meta-row strong { color: var(--text); }
+    audio { width: 100%; margin-top: 4px; }
+
+    @media (max-width: 720px) {
+      .cards { grid-template-columns: 1fr; }
+      .controls { flex-direction: column; align-items: stretch; }
+      .controls > * { width: 100%; }
+      select { min-width: 0; width: 100%; }
+    }
   </style>
 </head>
 <body>
@@ -100,68 +197,77 @@
     <header>
       <div>
         <h1>CloakBreak</h1>
-        <div class="caption">Real-time, codec-hardened voice deepfake detection</div>
+        <div class="tagline">Live check for cloned voices on a call</div>
       </div>
       <div class="badge" id="backendBadge">backend: connecting...</div>
     </header>
 
     <div class="controls">
       <button id="micBtn" class="primary">Start Live Mic</button>
-      <label class="caption" for="conditionSel">Channel:</label>
+      <label class="ctl-label" for="conditionSel">Simulate call channel</label>
       <select id="conditionSel">
-        <option value="clean">Clean (16 kHz)</option>
-        <option value="opus_16k">Opus 16 kbps</option>
-        <option value="phone_8k">Phone 8 kHz (G.711)</option>
+        <option value="clean">Clean</option>
+        <option value="opus_16k">Opus 16 kbps (WhatsApp-like)</option>
+        <option value="phone_8k">Phone 8 kHz</option>
       </select>
       <input type="file" id="wavInput" accept=".wav,audio/wav" />
       <button id="uploadBtn">Analyze WAV</button>
     </div>
 
-    <div class="grid">
+    <section class="banner" id="banner" aria-live="polite">
+      <div class="banner-text" id="bannerText">LISTENING</div>
+      <div class="banner-fresh" id="bannerFresh"></div>
+    </section>
+
+    <div class="cards">
       <div class="card">
-        <div class="label">CloakBreak (window score → smoothed verdict)</div>
-        <div class="score" id="cbScore">--</div>
-        <div class="bar-track"><div class="bar-fill" id="cbBar"></div></div>
-        <div class="meta-row">
-          <span>Verdict: <strong id="cbVerdict">Waiting</strong></span>
-          <span>Window: <strong id="winVerdict">--</strong></span>
-          <span>Threshold: <strong id="thresholdVal">--</strong></span>
-          <span>Latency: <strong id="latencyVal">-- ms</strong></span>
+        <div class="card-verdict" id="cbCardVerdict">CloakBreak: waiting</div>
+        <div>
+          <div class="score" id="cbScore">--</div>
+          <div class="score-cap">window spoof score</div>
         </div>
-        <div class="meta-row">
-          <span>Last scores: <strong id="recentScores">--</strong></span>
-          <span id="freshVal">--</span>
+        <div class="bar-track"><div class="bar-fill" id="cbBar"></div><div class="bar-tick" id="cbTick"></div></div>
+        <div class="win-line" id="winLine">This window: --</div>
+        <div class="meta">
+          <span><span class="k">Last scores</span> <span class="v" id="recentScores">--</span></span>
+          <span><span class="k">Latency</span> <span class="v" id="latencyVal">-- ms</span></span>
+          <span><span class="k">Threshold</span> <span class="v" id="thresholdVal" title="0.5">0.50</span></span>
         </div>
+        <canvas id="sparkCanvas" class="spark"></canvas>
+        <div class="caption">Last 30 scored windows</div>
       </div>
 
       <div class="card">
-        <div class="label">Legacy Baseline (Side-by-Side)</div>
-        <div class="score" id="baseScore">N/A</div>
-        <div class="bar-track"><div class="bar-fill" id="baseBar"></div></div>
-        <div class="meta-row">
-          <span>Model: <strong id="baseModel">Not loaded</strong></span>
-          <span>Speech VAD: <strong id="vadStatus">--</strong></span>
+        <div class="card-verdict" id="baseCardVerdict">Legacy detector: waiting</div>
+        <div>
+          <div class="score" id="baseScore">--</div>
+          <div class="score-cap">baseline spoof score</div>
+        </div>
+        <div class="bar-track"><div class="bar-fill" id="baseBar"></div><div class="bar-tick" id="baseTick"></div></div>
+        <div class="meta">
+          <span class="k">Model</span> <span class="v model-id" id="baseModel" title="">Not loaded</span>
+          <span><span class="k">Voice activity</span> <span class="v" id="vadStatus">--</span></span>
         </div>
       </div>
     </div>
 
     <div class="card" style="margin-bottom: 16px;">
-      <div class="label">Model Attention Focus (Where the Model Attended Across the 2.5s Window)</div>
-      <canvas id="focusCanvas" width="900" height="180"></canvas>
+      <h2 class="card-title">Model attention focus</h2>
+      <canvas id="focusCanvas" class="attn"></canvas>
       <div class="caption">
-        Bar height shows relative temporal attention weight per frame window. Attention reflects where the model focused, not ground-truth proof of spliced frames.
+        Where the model attended within the 2.5 s window. This shows model focus, not proof that any part of the audio is fake.
       </div>
     </div>
 
     <div class="card hidden" id="clonePanel">
-      <div class="label">Private Self-Clone Arena (Owner Only — Auth-Gated)</div>
-      <div class="controls" style="margin-top: 10px;">
+      <div class="card-title">Private self-clone arena (owner only, auth-gated)</div>
+      <div class="controls" style="margin-top: 4px;">
         <input type="password" id="cloneToken" placeholder="Bearer token" />
         <input type="text" id="cloneText" placeholder="Text to synthesize in your voice" style="flex: 1; min-width: 220px;" />
         <input type="file" id="cloneRefWav" accept=".wav,audio/wav" />
-        <button id="cloneBtn" class="danger">Generate &amp; Analyze Clone</button>
+        <button id="cloneBtn" class="danger">Generate &amp; analyze clone</button>
       </div>
-      <audio id="cloneAudio" controls style="width: 100%; margin-top: 8px;"></audio>
+      <audio id="cloneAudio" controls></audio>
     </div>
   </div>
 
@@ -172,12 +278,22 @@
       conditionSel: document.getElementById("conditionSel"),
       wavInput: document.getElementById("wavInput"),
       uploadBtn: document.getElementById("uploadBtn"),
+      banner: document.getElementById("banner"),
+      bannerText: document.getElementById("bannerText"),
+      bannerFresh: document.getElementById("bannerFresh"),
       cbScore: document.getElementById("cbScore"),
       cbBar: document.getElementById("cbBar"),
-      cbVerdict: document.getElementById("cbVerdict"),
+      cbTick: document.getElementById("cbTick"),
+      cbCardVerdict: document.getElementById("cbCardVerdict"),
+      winLine: document.getElementById("winLine"),
+      recentScores: document.getElementById("recentScores"),
       latencyVal: document.getElementById("latencyVal"),
+      thresholdVal: document.getElementById("thresholdVal"),
+      sparkCanvas: document.getElementById("sparkCanvas"),
       baseScore: document.getElementById("baseScore"),
       baseBar: document.getElementById("baseBar"),
+      baseTick: document.getElementById("baseTick"),
+      baseCardVerdict: document.getElementById("baseCardVerdict"),
       baseModel: document.getElementById("baseModel"),
       vadStatus: document.getElementById("vadStatus"),
       canvas: document.getElementById("focusCanvas"),
@@ -187,101 +303,254 @@
       cloneRefWav: document.getElementById("cloneRefWav"),
       cloneBtn: document.getElementById("cloneBtn"),
       cloneAudio: document.getElementById("cloneAudio"),
-      thresholdVal: document.getElementById("thresholdVal"),
-      winVerdict: document.getElementById("winVerdict"),
-      recentScores: document.getElementById("recentScores"),
-      freshVal: document.getElementById("freshVal"),
     };
 
-    const ctx2d = els.canvas.getContext("2d");
+    const COL = {
+      safe: "#22c55e",
+      warn: "#f59e0b",
+      danger: "#ef4444",
+      muted: "#8b95a7",
+      text: "#e6e9ef",
+      line: "#8b95a7",
+    };
+    const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    const SPARK_CAP = 30;
+
     let ws = null;
     let audioCtx = null;
     let mediaStream = null;
     let processor = null;
+    let currentThreshold = 0.5;
+    let baselineLoaded = null;
+    let lastBaselineProb = null;
+    let scoreHistory = [];
+    let lastFocus = null;
+    let lastProb = null;
 
-    function colorForProb(p) {
-      if (p >= 0.65) return "#ef4444";
-      if (p >= 0.35) return "#f59e0b";
-      return "#22c55e";
+    function colorFor(p, t) {
+      const tt = t == null ? 0.5 : Number(t);
+      if (p >= tt) return COL.danger;
+      if (p >= 0.75 * tt) return COL.warn;
+      return COL.safe;
+    }
+
+    function setBar(el, frac, color) {
+      el.style.transform = `scaleX(${Math.max(0, Math.min(1, frac))})`;
+      el.style.backgroundColor = color;
+    }
+
+    function setThreshold(t) {
+      const v = Number(t);
+      if (!isFinite(v)) return;
+      currentThreshold = v;
+      els.thresholdVal.textContent = v.toFixed(2);
+      els.thresholdVal.title = String(v);
+      els.cbTick.style.left = `${(v * 100).toFixed(2)}%`;
+      drawSpark();
+    }
+
+    const BANNER = {
+      real: { cls: "real", text: "REAL VOICE" },
+      clone: { cls: "clone", text: "LIKELY CLONE" },
+      listen: { cls: "", text: "LISTENING" },
+      warm: { cls: "", text: "WARMING UP" },
+      error: { cls: "", text: "DETECTOR ERROR" },
+    };
+
+    function setBanner(state, fresh) {
+      const b = BANNER[state] || BANNER.listen;
+      els.banner.className = "banner" + (b.cls ? " " + b.cls : "");
+      els.bannerText.textContent = b.text;
+      els.bannerFresh.textContent = fresh || "";
+    }
+
+    function fitCanvas(cv) {
+      const dpr = window.devicePixelRatio || 1;
+      const w = cv.clientWidth || cv.width || 300;
+      const h = cv.clientHeight || cv.height || 100;
+      const W = Math.max(1, Math.round(w * dpr));
+      const H = Math.max(1, Math.round(h * dpr));
+      if (cv.width !== W || cv.height !== H) {
+        cv.width = W;
+        cv.height = H;
+      }
+      const ctx = cv.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      return { ctx, w, h };
+    }
+
+    function drawSpark() {
+      const { ctx, w, h } = fitCanvas(els.sparkCanvas);
+      ctx.clearRect(0, 0, w, h);
+      const padL = 34, padR = 10, padT = 10, padB = 20;
+      const pw = Math.max(10, w - padL - padR);
+      const ph = Math.max(10, h - padT - padB);
+      const yOf = (p) => padT + (1 - p) * ph;
+
+      ctx.font = `10px ${MONO}`;
+      ctx.textAlign = "left";
+      [0, 0.5, 1].forEach((g) => {
+        const y = yOf(g);
+        ctx.globalAlpha = 0.3;
+        ctx.strokeStyle = COL.line;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(padL, y);
+        ctx.lineTo(padL + pw, y);
+        ctx.stroke();
+        ctx.globalAlpha = 0.85;
+        ctx.fillStyle = COL.muted;
+        ctx.fillText(g.toFixed(1), 4, y + 3);
+      });
+      ctx.globalAlpha = 1;
+
+      const ty = yOf(currentThreshold);
+      ctx.strokeStyle = COL.text;
+      ctx.globalAlpha = 0.75;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(padL, ty);
+      ctx.lineTo(padL + pw, ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      const labelY = ty - 5 < padT + 9 ? ty + 13 : ty - 5;
+      ctx.textAlign = "right";
+      ctx.fillStyle = COL.muted;
+      ctx.fillText(`threshold ${currentThreshold.toFixed(2)}`, padL + pw, labelY);
+      ctx.textAlign = "left";
+
+      const n = scoreHistory.length;
+      if (!n) return;
+      const xOf = (i) => padL + pw * (n === 1 ? 1 : i / (n - 1));
+      ctx.strokeStyle = COL.muted;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      scoreHistory.forEach((p, i) => {
+        const px = xOf(i), py = yOf(Math.max(0, Math.min(1, p)));
+        if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+      });
+      ctx.stroke();
+      const lx = xOf(n - 1), ly = yOf(Math.max(0, Math.min(1, scoreHistory[n - 1])));
+      ctx.fillStyle = COL.text;
+      ctx.beginPath();
+      ctx.arc(lx, ly, 3.5, 0, Math.PI * 2);
+      ctx.fill();
     }
 
     function drawAttention(focus, prob) {
-      const w = els.canvas.width;
-      const h = els.canvas.height;
-      ctx2d.clearRect(0, 0, w, h);
-      const bins = focus && focus.length ? focus : new Array(32).fill(0);
+      lastFocus = focus;
+      lastProb = prob;
+      const { ctx, w, h } = fitCanvas(els.canvas);
+      ctx.clearRect(0, 0, w, h);
+      const bins = Array.isArray(focus) && focus.length ? focus : new Array(32).fill(0);
       const barW = w / bins.length;
-      const color = prob == null ? "#334155" : colorForProb(prob);
+      const color = prob == null ? COL.muted : colorFor(prob, currentThreshold);
       bins.forEach((v, i) => {
-        const bh = Math.max(2, v * (h - 24));
-        ctx2d.fillStyle = color;
-        ctx2d.globalAlpha = 0.25 + 0.75 * v;
-        ctx2d.fillRect(i * barW + 2, h - bh - 8, Math.max(2, barW - 4), bh);
+        const val = Math.max(0, Math.min(1, Number(v) || 0));
+        const bh = Math.max(2, val * (h - 20));
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.3 + 0.7 * val;
+        ctx.fillRect(i * barW + 1, h - bh - 8, Math.max(1, barW - 2), bh);
       });
-      ctx2d.globalAlpha = 1.0;
+      ctx.globalAlpha = 1;
     }
 
-    function verdictLabel(v) {
-      if (v === "spoof") return "FAKE";
-      if (v === "bonafide") return "REAL";
-      return "--";
+    function updateBaselineCard() {
+      const bp = lastBaselineProb;
+      if (bp != null) {
+        els.baseScore.textContent = `${Math.round(bp * 100)}%`;
+        setBar(els.baseBar, bp, colorFor(bp, 0.5));
+        els.baseCardVerdict.textContent = bp >= 0.5 ? "Legacy detector: Clone" : "Legacy detector: Real";
+      } else if (baselineLoaded === false) {
+        els.baseScore.textContent = "N/A";
+        setBar(els.baseBar, 0, COL.muted);
+        els.baseCardVerdict.textContent = "Legacy detector: not loaded";
+      } else {
+        els.baseScore.textContent = "--";
+        setBar(els.baseBar, 0, COL.muted);
+        els.baseCardVerdict.textContent = "Legacy detector: waiting";
+      }
     }
 
     function renderResult(data) {
-      els.vadStatus.textContent = data.is_speech ? "Speech" : "Silence";
-      els.latencyVal.textContent = `${data.latency_ms ?? 0} ms`;
-      if (data.threshold != null) {
-        els.thresholdVal.textContent = `threshold ${Number(data.threshold).toFixed(2)}`;
+      if (!data || typeof data !== "object") return;
+      if (data.type === "error" || (data.detail != null && data.spoof_prob == null && data.type !== "prediction")) {
+        setBanner("error", String(data.detail || "unknown detector error"));
+        return;
       }
-      if (data.window_verdict != null) {
-        els.winVerdict.textContent = verdictLabel(data.window_verdict);
-      }
-      if (Array.isArray(data.recent_scores) && data.recent_scores.length) {
-        els.recentScores.textContent = data.recent_scores
-          .map((p) => Number(p).toFixed(2)).join("  ");
-      }
-      if (data.lag_ms != null && data.inference_ms != null) {
-        els.freshVal.textContent =
-          `scored audio ends ${(data.lag_ms / 1000).toFixed(1)}s ago · inference ${Math.round(data.inference_ms)} ms`;
-      }
-      if (data.warming_up) {
-        els.cbScore.textContent = "--";
-        els.cbBar.style.width = "0%";
-        const have = data.window_sec != null ? data.window_sec.toFixed(1) : "?";
-        els.cbVerdict.textContent = `Warming up (${have}s / 2.0s)`;
-        els.cbVerdict.style.color = "";
-      } else if (data.spoof_prob == null) {
-        els.cbScore.textContent = "--";
-        els.cbVerdict.textContent = "Listening (silence)";
-        els.cbVerdict.style.color = "";
-        els.cbBar.style.width = "0%";
+      if (data.threshold != null) setThreshold(data.threshold);
+
+      const isLive = data.type === "prediction";
+      const warming = data.warming_up === true;
+      const hasScore = data.spoof_prob != null && !warming;
+      const prob = hasScore ? Number(data.spoof_prob) : null;
+
+      if (warming) {
+        const have = data.window_sec != null ? Number(data.window_sec).toFixed(1) : "?";
+        setBanner("warm", `${have} s of 2.0 s buffered`);
+      } else if (hasScore) {
+        if (isLive) {
+          const lagS = data.lag_ms != null ? (Number(data.lag_ms) / 1000).toFixed(1) : "?";
+          const inf = Math.round(Number(data.inference_ms ?? data.latency_ms ?? 0));
+          setBanner(data.verdict === "spoof" ? "clone" : "real",
+            `Scored audio ends ${lagS} s ago · inference ${inf} ms`);
+          scoreHistory.push(prob);
+          if (scoreHistory.length > SPARK_CAP) scoreHistory.shift();
+          drawSpark();
+        } else {
+          const inf = Math.round(Number(data.latency_ms ?? 0));
+          setBanner(data.verdict === "spoof" ? "clone" : "real",
+            `File analysis · center 2.5 s window · inference ${inf} ms`);
+        }
+      } else if (isLive) {
+        setBanner("listen", data.is_speech === false ? "No speech in the latest window" : "Waiting for the first scored window");
       } else {
-        const pct = Math.round(data.spoof_prob * 100);
-        els.cbScore.textContent = `${pct}%`;
-        els.cbBar.style.width = `${pct}%`;
-        els.cbBar.style.background = colorForProb(data.spoof_prob);
-        els.cbVerdict.textContent = verdictLabel(data.verdict);
-        els.cbVerdict.style.color = data.verdict === "spoof" ? "#ef4444" : "#22c55e";
+        setBanner("listen", "");
       }
-      if (data.baseline_prob != null) {
-        const bpct = Math.round(data.baseline_prob * 100);
-        els.baseScore.textContent = `${bpct}%`;
-        els.baseBar.style.width = `${bpct}%`;
-        els.baseBar.style.background = colorForProb(data.baseline_prob);
-      }
-      drawAttention(data.attention_focus, data.spoof_prob);
+
+      els.cbScore.textContent = prob == null ? "--" : `${Math.round(prob * 100)}%`;
+      setBar(els.cbBar, prob == null ? 0 : prob, prob == null ? COL.muted : colorFor(prob, currentThreshold));
+
+      let wv = data.window_verdict;
+      if (wv == null && prob != null) wv = prob >= currentThreshold ? "spoof" : "bonafide";
+      els.winLine.textContent = wv === "spoof" ? "This window: above threshold"
+        : wv === "bonafide" ? "This window: below threshold" : "This window: --";
+
+      els.cbCardVerdict.textContent = data.verdict === "spoof" ? "CloakBreak: Clone"
+        : data.verdict === "bonafide" ? "CloakBreak: Real" : "CloakBreak: waiting";
+
+      els.recentScores.textContent = Array.isArray(data.recent_scores) && data.recent_scores.length
+        ? data.recent_scores.map((p) => Number(p).toFixed(2)).join("  ")
+        : "--";
+      els.latencyVal.textContent = data.latency_ms != null ? `${Math.round(Number(data.latency_ms))} ms` : "-- ms";
+      els.vadStatus.textContent = data.is_speech === true ? "speech" : data.is_speech === false ? "silence" : "--";
+
+      lastBaselineProb = data.baseline_prob != null ? Number(data.baseline_prob) : null;
+      updateBaselineCard();
+
+      drawAttention(data.attention_focus, prob);
     }
 
     async function fetchHealth() {
-      const res = await fetch("/api/health");
-      const data = await res.json();
-      els.backendBadge.textContent = `backend: ${data.backend}`;
-      els.baseModel.textContent = data.baseline_loaded ? data.baseline_id : "Not loaded";
-      if (data.threshold != null) {
-        els.thresholdVal.textContent = `threshold ${Number(data.threshold).toFixed(2)}`;
-      }
-      if (data.clone_enabled) {
-        els.clonePanel.classList.remove("hidden");
+      try {
+        const res = await fetch("/api/health");
+        const data = await res.json();
+        els.backendBadge.textContent = `backend: ${data.backend ?? "?"}`;
+        baselineLoaded = data.baseline_loaded === true;
+        if (baselineLoaded && data.baseline_id) {
+          els.baseModel.textContent = String(data.baseline_id).split("/").pop();
+          els.baseModel.title = String(data.baseline_id);
+        } else {
+          els.baseModel.textContent = "Not loaded";
+          els.baseModel.title = "";
+        }
+        updateBaselineCard();
+        if (data.threshold != null) setThreshold(data.threshold);
+        if (data.clone_enabled) els.clonePanel.classList.remove("hidden");
+      } catch (err) {
+        els.backendBadge.textContent = "backend: unreachable";
       }
     }
 
@@ -308,21 +577,24 @@
 
     async function stopMic() {
       if (processor) { processor.disconnect(); processor = null; }
-      if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+      if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
       if (audioCtx) { await audioCtx.close(); audioCtx = null; }
       if (ws) { ws.close(); ws = null; }
       els.micBtn.textContent = "Start Live Mic";
       els.micBtn.className = "primary";
+      setBanner("listen", "Microphone stopped");
     }
 
     els.micBtn.addEventListener("click", async () => {
       if (ws) { await stopMic(); return; }
+      scoreHistory = [];
+      drawSpark();
+      setBanner("listen", "Streaming — first verdict after 2.0 s of audio");
       const proto = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${proto}://${location.host}/ws/detect`);
       ws.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
-        if (data.type === "prediction") renderResult(data);
-        else if (data.type === "error") els.cbVerdict.textContent = `ERROR: ${data.detail}`;
+        if (data.type === "prediction" || data.type === "error") renderResult(data);
       };
       ws.onopen = async () => {
         ws.send(JSON.stringify({ condition: els.conditionSel.value }));
@@ -393,7 +665,13 @@
       }
     });
 
+    els.baseTick.style.left = "50%";
+    window.addEventListener("resize", () => {
+      drawSpark();
+      drawAttention(lastFocus, lastProb);
+    });
     drawAttention([], null);
+    drawSpark();
     fetchHealth();
   </script>
 </body>

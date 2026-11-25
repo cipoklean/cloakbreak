@@ -53,6 +53,12 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
 
 ## Try It in 5 Minutes
 
+The demo UI in a mocked "clone detected" state (desktop):
+
+![CloakBreak demo UI showing a mocked LIKELY CLONE verdict](docs/screenshots/desktop-clone.png)
+
+*Mocked UI states rendered by `scripts/render_screenshots.py` from deterministic payloads — not measurements. Other states: [real voice](docs/screenshots/desktop-real.png), [warming up](docs/screenshots/desktop-warming.png), [mobile real](docs/screenshots/mobile-real.png), [mobile clone](docs/screenshots/mobile-clone.png), [mobile warming](docs/screenshots/mobile-warming.png).*
+
 1. Clone and install the CPU stack (the tests were run with Python 3.11 and `torch 2.15.0+cpu`):
    ```bash
    git clone https://github.com/cipoklean/cloakbreak.git && cd cloakbreak
@@ -132,7 +138,7 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 - ARM CPU latency per 2.5 s window (fp32 ONNX, 2 threads, Oracle Neoverse-N1 with 2 vCPUs, 100 test clips): p50 702.1 ms, p95 1218.8 ms (`results/latency_oracle_arm_fp32.json`).
 - Live stream on the same ARM VM (2 min, real time, fp32 ONNX): verdict lag p50 681.3 ms, p95 741.5 ms, max 796.5 ms, with one inference in flight at a time (`results/live_lag_oracle_arm_fp32.json`).
 - fp32 ONNX vs torch checkpoint on the 1,053 val clips: identical AUROC (0.9740) and EER (8.67%), max probability difference 0.0001.
-- 52 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
+- 53 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
 
 ## Honest Limits
 
@@ -159,6 +165,7 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 cloakbreak/
 ├── app/main.py                 FastAPI app: detect-file, WebSocket stream, private clone endpoint
 ├── frontend/index.html         Live demo UI
+├── docs/screenshots/           Mocked demo-state screenshots (render_screenshots.py)
 ├── src/
 │   ├── audio_utils.py          Loading, loudness normalization, rolling buffer, SNR / rolloff features
 │   ├── augment.py              Codec, phone, noise, clipping and spectral augmentation; Opus cache
@@ -178,6 +185,7 @@ cloakbreak/
 │   ├── preflight_vast.py       Import sweep, hidden-backend checks, GPU check
 │   ├── bench_latency.py        CPU latency benchmark for the ONNX model
 │   ├── bench_live_lag.py       End-to-end live verdict-lag benchmark (uvicorn + WebSocket client)
+│   ├── render_screenshots.py   Playwright screenshots of mocked demo states (not measurements)
 │   └── hf_auth_check.py        HF token role / namespace check
 ├── results/
 │   ├── threshold_calibration.json   Val-selected threshold + test FPR/TPR (CPU re-run)

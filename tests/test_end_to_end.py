@@ -357,7 +357,7 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
     r_root = client.get("/")
     assert r_root.status_code == 200
     assert "CloakBreak" in r_root.text
-    assert "Model Attention Focus" in r_root.text
+    assert "Model attention focus" in r_root.text
 
     r_health = client.get("/api/health")
     assert r_health.status_code == 200
@@ -438,6 +438,21 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
         assert stats["n_scored"] >= 1
         assert stats["n_pushed_chunks"] == 8
         assert stats["total_sec"] == pytest.approx(2.0)
+
+
+def test_frontend_demo_page_static() -> None:
+    """Static contract for the demo-readable frontend (no server round-trip)."""
+    html = (Path(__file__).resolve().parents[1] / "frontend" / "index.html").read_text(encoding="utf-8")
+    assert "Simulate call channel" in html
+    for label in ("Clean", "Opus 16 kbps (WhatsApp-like)", "Phone 8 kHz"):
+        assert f">{label}<" in html
+    # colors must come from the server threshold, not hard-coded cutoffs
+    assert "0.65" not in html and "0.35" not in html
+    for state in ("REAL VOICE", "LIKELY CLONE", "WARMING UP", "LISTENING"):
+        assert state in html
+    low = html.lower()
+    assert "where the model attended" in low
+    assert "not proof" in low
 
 
 def test_app_threshold_precedence_verdict_and_min_window(
