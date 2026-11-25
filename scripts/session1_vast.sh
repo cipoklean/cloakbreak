@@ -15,6 +15,11 @@ set -euo pipefail
 #   bash scripts/session1_vast.sh           -> runs smoke automatically as Step 2b, then full Session 1
 #   ALLOW_SHORTCUT_WARNING=1 ...            -> allow Step 4 to continue if shortcut_warning is true
 #
+# Step 1 deps are keyed to requirements-gpu.lock: logs/.s1_deps_done stores the
+# lockfile sha256, so any lock change forces a reinstall and reruns preflight.
+# HF auth (token role + namespace) is verified every run before Step 1 via
+# scripts/hf_auth_check.py (stdlib-only, safe before deps are installed).
+#
 # Run INSIDE tmux so SSH drops on mobile data never kill progress:
 #   tmux new -s cb
 #   bash scripts/session1_vast.sh
@@ -47,11 +52,14 @@ if [ -z "${HF_TOKEN:-}" ]; then
   exit 1
 fi
 
-HF_DATASET_REPO="${HF_DATASET_REPO:-cipoklean/cloakbreak-data-v1}"
+HF_DATASET_REPO="${HF_DATASET_REPO:-Cipoklean/cloakbreak-data-v1}"
 export HF_DATASET_REPO
 
 # Redirect all subsequent output to both screen and logs/session1.log
 exec > >(tee -a "$LOG_FILE") 2>&1
+
+# Fail fast (stdlib-only) if the HF token/namespace cannot upload before spending GPU time.
+python3 -m scripts.hf_auth_check
 
 echo "================================================================="
 echo "[session1] Started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -60,7 +68,14 @@ echo "[session1] Host vCPUs: $(nproc)"
 echo "================================================================="
 
 # Step 1: System + pinned lockfile dependencies + strict pip check
-if [ ! -f logs/.s1_deps_done ]; then
+# logs/.s1_deps_done stores the requirements-gpu.lock sha256: reinstall whenever
+# the lockfile changes (or the marker is missing/empty/stale).
+LOCK_HASH="$(sha256sum requirements-gpu.lock | cut -d' ' -f1)"
+S1_MARKER_HASH="$(cat logs/.s1_deps_done 2>/dev/null || true)"
+if [ ! -f logs/.s1_deps_done ] || [ "$S1_MARKER_HASH" != "$LOCK_HASH" ]; then
+  if [ -f logs/.s1_deps_done ]; then
+    echo "[step 1/6] requirements-gpu.lock changed (marker ${S1_MARKER_HASH:0:12} -> ${LOCK_HASH:0:12}) — reinstalling dependencies."
+  fi
   echo "[step 1/6] Installing apt packages (ffmpeg, espeak-ng, libsndfile1, tmux)..."
   apt-get update -qq
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg espeak-ng libsndfile1 tmux
@@ -70,9 +85,12 @@ if [ ! -f logs/.s1_deps_done ]; then
   echo "[step 1/6] Verifying dependency consistency via pip check..."
   python3 -m pip check
   python3 -m spacy download en_core_web_sm --quiet || true
-  touch logs/.s1_deps_done
+  echo "$LOCK_HASH" > logs/.s1_deps_done
+  # Deps changed (or first install) => preflight must rerun against the new env.
+  rm -f logs/.s1_preflight_done
+  echo "[step 1/6] Dependencies (re)installed; cleared logs/.s1_preflight_done so step 2 preflight reruns."
 else
-  echo "[step 1/6] Dependencies already installed (logs/.s1_deps_done) — skipping."
+  echo "[step 1/6] Dependencies already installed and requirements-gpu.lock unchanged (${LOCK_HASH:0:12}) — skipping."
 fi
 
 # Step 2: 60-second GPU preflight + full import sweep (fail fast before spending GPU-hours)

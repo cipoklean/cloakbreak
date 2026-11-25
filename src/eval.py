@@ -4,8 +4,9 @@ import argparse
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Callable, Dict, List, Sequence
 
 import numpy as np
 from scipy.optimize import minimize
@@ -19,7 +20,14 @@ from src.audio_utils import (
     pad_or_crop,
     spectral_rolloff_hz,
 )
-from src.augment import EvalCondition, degrade_for_eval
+from src.augment import (
+    SPECTRAL_AUG_RANGES,
+    EvalCondition,
+    TrainCodecAugmenter,
+    degrade_for_eval,
+    has_ffmpeg,
+    precompute_opus_cache,
+)
 from src.generate_spoofs import assert_disjoint_text_splits
 from src.model import (
     DEFAULT_BASELINE_ID,
@@ -159,6 +167,50 @@ def _feature_means(feats: np.ndarray, labels: np.ndarray) -> Dict[str, Dict[str,
     return out
 
 
+def _select_audit_rows(rows: List[Dict], max_per_split: int) -> tuple[List[Dict], List[Dict]]:
+    """Shared train/test row selection for shortcut audits (train excludes Kokoro)."""
+    train_rows = [r for r in rows if r.get("split") == "train" and "kokoro" not in r.get("generator", "")][:max_per_split]
+    test_rows = [r for r in rows if r.get("split") == "test"][:max_per_split]
+    if not train_rows or not test_rows:
+        mid = max(2, len(rows) // 2)
+        train_rows, test_rows = rows[:mid], rows[mid:]
+    return train_rows, test_rows
+
+
+def _clean_model_window(wav: np.ndarray, sr: int) -> np.ndarray:
+    return normalize_loudness(pad_or_crop(wav, DEFAULT_WINDOW_SAMPLES, random_crop=False))
+
+
+def _window_shortcut_features(raw_dur_s: float, win: np.ndarray) -> List[float]:
+    win_sec = DEFAULT_WINDOW_SAMPLES / float(TARGET_SR)
+    return [
+        min(raw_dur_s, win_sec),
+        audio_rms(win),
+        estimate_snr_db(win, TARGET_SR),
+        spectral_rolloff_hz(win, TARGET_SR),
+    ]
+
+
+def _clean_eval_window(wav: np.ndarray, sr: int, row: Dict) -> np.ndarray:
+    return _clean_model_window(wav, sr)
+
+
+def _extract_window_feature_rows(
+    rows: List[Dict],
+    window_fn: Callable[[np.ndarray, int, Dict], np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load each row once, build its model-input window via ``window_fn``, return (features, labels)."""
+    feats: List[List[float]] = []
+    labels: List[int] = []
+    for r in rows:
+        wav, sr = load_wav_mono(r["path"], target_sr=TARGET_SR)
+        raw_dur = wav.shape[0] / float(sr)
+        win = window_fn(wav, sr, r)
+        feats.append(_window_shortcut_features(raw_dur, win))
+        labels.append(int(r["label"]))
+    return np.asarray(feats, dtype=np.float64), np.asarray(labels, dtype=np.float64)
+
+
 def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
     """Audit dataset for trivial acoustic/channel shortcuts before trusting neural metrics.
 
@@ -170,14 +222,7 @@ def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
     """
     rows = _resolve_manifest_rows(manifest_path)
     assert_disjoint_text_splits(rows)
-
-    train_rows = [r for r in rows if r.get("split") == "train" and "kokoro" not in r.get("generator", "")][:max_per_split]
-    test_rows = [r for r in rows if r.get("split") == "test"][:max_per_split]
-    if not train_rows or not test_rows:
-        mid = max(2, len(rows) // 2)
-        train_rows, test_rows = rows[:mid], rows[mid:]
-
-    win_sec = DEFAULT_WINDOW_SAMPLES / float(TARGET_SR)
+    train_rows, test_rows = _select_audit_rows(rows, max_per_split)
 
     def extract(subset: List[Dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         raw_feats, win_feats, labels = [], [], []
@@ -191,14 +236,8 @@ def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
                 spectral_rolloff_hz(wav, sr),
             ])
 
-            win = normalize_loudness(pad_or_crop(wav, DEFAULT_WINDOW_SAMPLES, random_crop=False))
-            eff_dur = min(raw_dur, win_sec)
-            win_feats.append([
-                eff_dur,
-                audio_rms(win),
-                estimate_snr_db(win, TARGET_SR),
-                spectral_rolloff_hz(win, TARGET_SR),
-            ])
+            win = _clean_model_window(wav, sr)
+            win_feats.append(_window_shortcut_features(raw_dur, win))
             labels.append(int(r["label"]))
         return (
             np.asarray(raw_feats, dtype=np.float64),
@@ -242,9 +281,99 @@ def run_shortcut_audit(manifest_path: Path, max_per_split: int = 1000) -> Dict:
             **ck_metrics,
             "shortcut_warning": _is_shortcut(ck_metrics),
             "test_feature_means": _feature_means(ck_win, y_ck),
+            "num_scored": len(pair),
         }
 
     return audit
+
+
+def run_augmented_shortcut_audit(
+    manifest_path: Path,
+    max_per_split: int = 1000,
+    seed: int = 42,
+    opus_cache_dir: str | Path | None = None,
+) -> Dict:
+    """Shortcut audit under the same augmentation pipeline used in training.
+
+    Builds model-input windows exactly like ``SpoofAudioDataset`` (random crop +
+    cached Opus variant + ``TrainCodecAugmenter``) for train rows (augmenter
+    ``seed``) and test rows (``seed + 1``), then fits the trivial 4-feature
+    logistic on augmented train windows and scores augmented test windows.
+    ``model_window_shortcuts`` repeats the unaugmented audit on the same rows
+    for before/after comparison. The augmenter never sees labels.
+    """
+    rows = _resolve_manifest_rows(manifest_path)
+    assert_disjoint_text_splits(rows)
+    train_rows, test_rows = _select_audit_rows(rows, max_per_split)
+
+    opus_cache_map: Dict[str, str] = {}
+    cache_dir: Path | None = None
+    if has_ffmpeg():
+        cache_dir = Path(opus_cache_dir) if opus_cache_dir is not None else manifest_path.parent / "opus_cache_16k"
+        opus_cache_map = precompute_opus_cache(
+            [r["path"] for r in train_rows] + [r["path"] for r in test_rows],
+            cache_dir=cache_dir,
+            bitrate_kbps=16,
+        )
+
+    def make_augmented_window_fn(augmenter: TrainCodecAugmenter, crop_seed: int) -> Callable:
+        crop_rng = np.random.default_rng(crop_seed)
+
+        def window_fn(wav: np.ndarray, sr: int, row: Dict) -> np.ndarray:
+            win = pad_or_crop(wav, DEFAULT_WINDOW_SAMPLES, random_crop=True, rng=crop_rng)
+            cached = None
+            src = row["path"]
+            if src in opus_cache_map:
+                opus_wav, _ = load_wav_mono(opus_cache_map[src], target_sr=TARGET_SR)
+                cached = pad_or_crop(opus_wav, DEFAULT_WINDOW_SAMPLES, random_crop=True, rng=crop_rng)
+            return augmenter(win, sr=sr, cached_opus_waveform=cached)
+
+        return window_fn
+
+    train_aug = TrainCodecAugmenter(allow_inline_opus=False, seed=seed)
+    test_aug = TrainCodecAugmenter(allow_inline_opus=False, seed=seed + 1)
+
+    tr_clean, y_tr = _extract_window_feature_rows(train_rows, _clean_eval_window)
+    te_clean, y_te = _extract_window_feature_rows(test_rows, _clean_eval_window)
+    tr_aug, _ = _extract_window_feature_rows(train_rows, make_augmented_window_fn(train_aug, seed))
+    te_aug, _ = _extract_window_feature_rows(test_rows, make_augmented_window_fn(test_aug, seed + 1))
+
+    w_clean, mu_c, sig_c, const_c = _fit_logistic_weights(tr_clean, y_tr)
+    clean_metrics = _score_logistic(w_clean, mu_c, sig_c, const_c, te_clean, y_te)
+
+    w_aug, mu_a, sig_a, const_a = _fit_logistic_weights(tr_aug, y_tr)
+    aug_metrics = _score_logistic(w_aug, mu_a, sig_a, const_a, te_aug, y_te)
+
+    return {
+        "disjoint_text_check": "PASSED",
+        "features": SHORTCUT_FEATURE_NAMES,
+        "num_train": len(train_rows),
+        "num_test": len(test_rows),
+        "seed": seed,
+        "model_window_shortcuts": {
+            **clean_metrics,
+            "shortcut_warning": _is_shortcut(clean_metrics),
+            "test_feature_means": _feature_means(te_clean, y_te),
+        },
+        "augmented_train_window_shortcuts": {
+            **aug_metrics,
+            "shortcut_warning": _is_shortcut(aug_metrics),
+            "test_feature_means": _feature_means(te_aug, y_te),
+        },
+        "augmentation": {
+            "allow_inline_opus": False,
+            "p_codec": train_aug.p_codec,
+            "p_noise": train_aug.p_noise,
+            "p_clip": train_aug.p_clip,
+            "p_lowpass": train_aug.p_lowpass,
+            "p_low_shelf": train_aug.p_low_shelf,
+            "p_high_shelf": train_aug.p_high_shelf,
+            "p_tilt": train_aug.p_tilt,
+            "spectral_param_ranges": SPECTRAL_AUG_RANGES,
+            "opus_cache_dir": str(cache_dir) if cache_dir is not None else None,
+            "opus_cached_clips": len(opus_cache_map),
+        },
+    }
 
 
 def evaluate_slice(
@@ -313,13 +442,149 @@ def evaluate_clean_real_fpr(
     return out
 
 
+def build_rolloff_matched_pair(
+    reals: List[Dict],
+    spoofs: List[Dict],
+    n_bins: int = 10,
+    max_total: int | None = None,
+    seed: int = 42,
+) -> tuple[List[Dict], Dict]:
+    """Balance real/spoof pools across spectral-rolloff bins.
+
+    Computes rolloff_85 on the clean model-input window for each candidate,
+    bins the pooled rolloffs into quantile bins, and samples an equal number of
+    real and spoof rows per bin so the trivial rolloff shortcut cannot separate
+    the classes. Candidate pools are capped at 4*max_total via seeded shuffle to
+    bound CPU time; when the matched total exceeds ``max_total`` each bin's k is
+    scaled down proportionally (floor) keeping real==spoof per bin.
+    Returns (matched_rows, summary).
+    """
+    rng = np.random.default_rng(seed)
+    pool_cap = 4 * max_total if max_total is not None else None
+
+    def capped(pool: List[Dict]) -> List[Dict]:
+        if pool_cap is None or len(pool) <= pool_cap:
+            return list(pool)
+        idx = rng.permutation(len(pool))[:pool_cap]
+        return [pool[int(i)] for i in idx]
+
+    real_pool = capped(reals)
+    spoof_pool = capped(spoofs)
+
+    def pool_rolloffs(pool: List[Dict]) -> np.ndarray:
+        out = np.zeros(len(pool), dtype=np.float64)
+        for i, row in enumerate(pool):
+            wav, sr = load_wav_mono(row["path"], target_sr=TARGET_SR)
+            win = _clean_model_window(wav, sr)
+            out[i] = spectral_rolloff_hz(win, TARGET_SR)
+        return out
+
+    real_r = pool_rolloffs(real_pool)
+    spoof_r = pool_rolloffs(spoof_pool)
+
+    before = {
+        "real": round(float(real_r.mean()), 2) if real_r.size else None,
+        "spoof": round(float(spoof_r.mean()), 2) if spoof_r.size else None,
+    }
+
+    summary: Dict = {
+        "n_bins": n_bins,
+        "max_total": max_total,
+        "pool_cap": pool_cap,
+        "seed": seed,
+        "pool_sizes": {"real": len(real_pool), "spoof": len(spoof_pool)},
+        "n_bins_used": 0,
+        "per_bin": [],
+        "rolloff_mean_hz": {"before": before, "after": {"real": None, "spoof": None}},
+    }
+    if not real_pool or not spoof_pool:
+        return [], summary
+
+    pooled = np.concatenate([real_r, spoof_r])
+    edges = np.unique(np.quantile(pooled, np.linspace(0.0, 1.0, n_bins + 1)))
+    if edges.size < 2:
+        edges = np.array([float(pooled.min()) - 1e-6, float(pooled.max()) + 1e-6])
+
+    def bin_index(rolloffs: np.ndarray) -> np.ndarray:
+        return np.clip(np.searchsorted(edges, rolloffs, side="right") - 1, 0, edges.size - 2)
+
+    real_bins = bin_index(real_r)
+    spoof_bins = bin_index(spoof_r)
+    n_bins_eff = edges.size - 1
+
+    k_avail = np.zeros(n_bins_eff, dtype=np.int64)
+    for b in range(n_bins_eff):
+        k_avail[b] = min(int(np.sum(real_bins == b)), int(np.sum(spoof_bins == b)))
+
+    total_items = int(2 * k_avail.sum())
+    if max_total is not None and total_items > max_total and total_items > 0:
+        k_final = np.floor(k_avail * (max_total / float(total_items))).astype(np.int64)
+    else:
+        k_final = k_avail
+
+    pair: List[Dict] = []
+    sel_real_idx: List[int] = []
+    sel_spoof_idx: List[int] = []
+    per_bin: List[Dict] = []
+    for b in range(n_bins_eff):
+        k = int(k_final[b])
+        if k <= 0:
+            continue
+        ri = np.flatnonzero(real_bins == b)
+        si = np.flatnonzero(spoof_bins == b)
+        take_r = rng.choice(ri, size=min(k, ri.size), replace=False)
+        take_s = rng.choice(si, size=min(k, si.size), replace=False)
+        sel_real_idx.extend(int(i) for i in take_r)
+        sel_spoof_idx.extend(int(i) for i in take_s)
+        for i in take_r:
+            pair.append(real_pool[int(i)])
+        for i in take_s:
+            pair.append(spoof_pool[int(i)])
+        per_bin.append(
+            {
+                "lo_hz": round(float(edges[b]), 2),
+                "hi_hz": round(float(edges[b + 1]), 2),
+                "n_real": int(take_r.size),
+                "n_spoof": int(take_s.size),
+            }
+        )
+
+    if sel_real_idx:
+        after_real = float(real_r[np.asarray(sel_real_idx, dtype=np.int64)].mean())
+    else:
+        after_real = float("nan")
+    if sel_spoof_idx:
+        after_spoof = float(spoof_r[np.asarray(sel_spoof_idx, dtype=np.int64)].mean())
+    else:
+        after_spoof = float("nan")
+
+    summary["n_bins_used"] = len(per_bin)
+    summary["per_bin"] = per_bin
+    summary["rolloff_mean_hz"]["after"] = {
+        "real": round(after_real, 2) if np.isfinite(after_real) else None,
+        "spoof": round(after_spoof, 2) if np.isfinite(after_spoof) else None,
+    }
+    return pair, summary
+
+
+def save_audit_json(audit: Dict, results_dir: Path, kind: str, manifest_path: Path) -> Path:
+    """Persist an audit JSON under ``results/{kind}_{manifest_parent}_{UTC ts}.json``."""
+    results_dir = Path(results_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    out_path = results_dir / f"{kind}_{manifest_path.parent.name}_{stamp}.json"
+    out_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    print(f"[audit-json] wrote {out_path}")
+    return out_path
+
+
 def format_markdown_table(results: Dict[str, Dict]) -> str:
     lines = [
         "| Eval Slice | Clips (Real/Spoof) | Baseline EER (%) | CloakBreak EER (%) | CloakBreak AUROC | p50 / p95 Latency (ms) |",
         "| :--- | :---: | :---: | :---: | :---: | :---: |",
     ]
     for name, r in results.items():
-        if name in {"shortcut_audit", "clean_real_fpr"}:
+        if "num_clips" not in r:
             continue
         base_eer = f"{r['baseline']['eer_pct']:.2f}" if "baseline" in r else "N/A"
         cb_eer = f"{r['cloakbreak']['eer_pct']:.2f}"
@@ -327,6 +592,22 @@ def format_markdown_table(results: Dict[str, Dict]) -> str:
         lat = f"{r['latency_p50_ms']:.1f} / {r['latency_p95_ms']:.1f}"
         counts = f"{r['num_clips']} ({r['num_real']}/{r['num_spoof']})"
         lines.append(f"| {name} | {counts} | {base_eer} | {cb_eer} | {cb_auc} | {lat} |")
+
+    audit = results.get("shortcut_audit") or {}
+    audit_num_test = audit.get("num_test")
+    model_win = audit.get("model_window_shortcuts") or {}
+    if model_win:
+        lines.append(
+            f"| Floor: trivial 4-feature logistic (dur/RMS/SNR/rolloff) "
+            f"| {audit_num_test} | N/A | {model_win['eer_pct']:.2f} | {model_win['auroc']:.4f} | N/A |"
+        )
+    kokoro_short = audit.get("clean_real_vs_kokoro_shortcuts") or {}
+    if kokoro_short:
+        lines.append(
+            f"| Floor: trivial 4-feature logistic (clean real vs Kokoro) "
+            f"| {kokoro_short.get('num_scored', audit_num_test)} | N/A | {kokoro_short['eer_pct']:.2f} | "
+            f"{kokoro_short['auroc']:.4f} | N/A |"
+        )
 
     if "clean_real_fpr" in results:
         fpr = results["clean_real_fpr"]
@@ -346,6 +627,7 @@ def run_evaluation(
     baseline: BaselineDetectorRuntime | None = None,
     max_per_slice: int = 500,
     out_json: Path | None = None,
+    results_dir: Path | None = None,
 ) -> Dict[str, Dict]:
     rows = _resolve_manifest_rows(manifest_path)
     test_rows = [r for r in rows if r.get("split") == "test"]
@@ -382,11 +664,31 @@ def run_evaluation(
         slices["clean_real_vs_kokoro_opus_16k"] = evaluate_slice(
             clean_vs_kokoro_pair, detector, condition="opus_16k", baseline=baseline
         )
+
+    if real_test and main_spoof:
+        matched, rolloff_summary = build_rolloff_matched_pair(
+            real_test, main_spoof, max_total=max_per_slice, seed=42
+        )
+        if matched:
+            res = evaluate_slice(matched, detector, condition="clean", baseline=baseline)
+            res["rolloff_matching"] = rolloff_summary
+            slices["rolloff_matched_clean"] = res
+    if real_test and kokoro_spoof:
+        matched_k, rolloff_summary_k = build_rolloff_matched_pair(
+            real_test, kokoro_spoof, max_total=max_per_slice, seed=42
+        )
+        if matched_k:
+            res_k = evaluate_slice(matched_k, detector, condition="clean", baseline=baseline)
+            res_k["rolloff_matching"] = rolloff_summary_k
+            slices["rolloff_matched_unseen_kokoro_clean"] = res_k
+
     if clean_real_test:
         slices["clean_real_fpr"] = evaluate_clean_real_fpr(
             clean_real_test[:max_per_slice], detector, baseline=baseline, condition="clean"
         )
 
+    if results_dir is not None:
+        save_audit_json(slices["shortcut_audit"], Path(results_dir), "eval_shortcut_audit", manifest_path)
     if out_json is not None:
         out_json.parent.mkdir(parents=True, exist_ok=True)
         out_json.write_text(json.dumps(slices, indent=2), encoding="utf-8")
@@ -402,7 +704,13 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--max-per-slice", type=int, default=600)
     parser.add_argument("--out-json", type=Path, default=Path("eval/results.json"))
+    parser.add_argument("--results-dir", type=Path, default=Path("results"))
     parser.add_argument("--shortcut-only", action="store_true", help="Run only acoustic shortcut audit & disjoint check")
+    parser.add_argument(
+        "--augment-train-windows",
+        action="store_true",
+        help="With --shortcut-only: audit trivial features on augmentation-pipeline windows (train seed, test seed+1)",
+    )
     parser.add_argument(
         "--fail-on-shortcut",
         action="store_true",
@@ -420,8 +728,25 @@ def main() -> None:
         return False
 
     if args.shortcut_only:
+        if args.augment_train_windows:
+            audit = run_augmented_shortcut_audit(args.manifest, max_per_split=args.max_per_slice)
+            print(json.dumps(audit, indent=2))
+            aug_metrics = audit["augmented_train_window_shortcuts"]
+            unaug_auc = audit["model_window_shortcuts"]["auroc"]
+            print(
+                f"[augmented audit] trivial AUROC unaugmented={unaug_auc:.4f} "
+                f"augmented={aug_metrics['auroc']:.4f} (threshold 0.60)"
+            )
+            save_audit_json(audit, args.results_dir, "shortcut_audit_augmented", args.manifest)
+            if aug_metrics.get("shortcut_warning"):
+                print("[SHORTCUT WARNING] Trivial acoustic classifier still exceeds chance on augmented model windows!")
+                if args.fail_on_shortcut and not allow_shortcut:
+                    sys.exit(2)
+            return
+
         audit = run_shortcut_audit(args.manifest, max_per_split=args.max_per_slice)
         print(json.dumps(audit, indent=2))
+        save_audit_json(audit, args.results_dir, "shortcut_audit", args.manifest)
         if _has_shortcut_warning(audit):
             print("[SHORTCUT WARNING] Trivial acoustic classifier exceeded chance on model input windows!")
             if args.fail_on_shortcut and not allow_shortcut:
@@ -446,6 +771,7 @@ def main() -> None:
         baseline=baseline,
         max_per_slice=args.max_per_slice,
         out_json=args.out_json,
+        results_dir=args.results_dir,
     )
     print("=== Shortcut Audit (Duration + RMS + SNR + Spectral Rolloff) ===")
     print(json.dumps(results["shortcut_audit"], indent=2))

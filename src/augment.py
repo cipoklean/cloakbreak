@@ -149,6 +149,106 @@ def apply_soft_clipping(waveform: np.ndarray, drive: float = 1.8) -> np.ndarray:
     return (np.tanh(waveform * drive) / np.tanh(drive)).astype(np.float32)
 
 
+SPECTRAL_AUG_RANGES: Dict[str, List[float]] = {
+    "lowpass_fc_hz": [3400.0, 8000.0],  # high end clamped to 0.95 * nyquist
+    "low_shelf_gain_db": [-6.0, 6.0],
+    "low_shelf_corner_hz": [100.0, 500.0],
+    "high_shelf_gain_db": [-6.0, 6.0],
+    "high_shelf_corner_hz": [1000.0, 4000.0],
+    "tilt_db_per_octave": [-1.5, 1.5],
+}
+
+
+def _sample_spectral_params(
+    rng: np.random.Generator,
+    sr: int,
+    p_lowpass: float = 0.4,
+    p_low_shelf: float = 0.6,
+    p_high_shelf: float = 0.6,
+    p_tilt: float = 0.6,
+) -> Dict[str, Dict[str, float]]:
+    """Draw every spectral-augmentation decision/parameter from ``rng``.
+
+    The draw order is fixed and never inspects the waveform, so real and fake
+    clips receive identical transform distributions for a given seed.
+    """
+    fc_hi = max(3400.0, min(8000.0, 0.95 * 0.5 * sr))
+    return {
+        "lowpass": {
+            "apply": bool(rng.random() < p_lowpass),
+            "fc_hz": float(rng.uniform(3400.0, fc_hi)),
+        },
+        "low_shelf": {
+            "apply": bool(rng.random() < p_low_shelf),
+            "gain_db": float(rng.uniform(*SPECTRAL_AUG_RANGES["low_shelf_gain_db"])),
+            "corner_hz": float(rng.uniform(*SPECTRAL_AUG_RANGES["low_shelf_corner_hz"])),
+        },
+        "high_shelf": {
+            "apply": bool(rng.random() < p_high_shelf),
+            "gain_db": float(rng.uniform(*SPECTRAL_AUG_RANGES["high_shelf_gain_db"])),
+            "corner_hz": float(rng.uniform(*SPECTRAL_AUG_RANGES["high_shelf_corner_hz"])),
+        },
+        "tilt": {
+            "apply": bool(rng.random() < p_tilt),
+            "tilt_db_per_octave": float(rng.uniform(*SPECTRAL_AUG_RANGES["tilt_db_per_octave"])),
+        },
+    }
+
+
+def _shelf_weight(freqs: np.ndarray, corner_hz: float, width_octaves: float = 0.3) -> np.ndarray:
+    """Smooth 0 -> 1 logistic step in log2-frequency, ~1 octave wide, at ``corner_hz``."""
+    u = np.log2(np.maximum(freqs, 1.0) / corner_hz)
+    return 1.0 / (1.0 + np.exp(-u / width_octaves))
+
+
+def _spectral_gain_linear(freqs: np.ndarray, params: Dict[str, Dict[str, float]]) -> np.ndarray:
+    """Combined linear amplitude gain curve (length = len(freqs)) for one rfft."""
+    f = freqs.astype(np.float64)
+    gain_db = np.zeros(f.shape[0], dtype=np.float64)
+
+    tilt = params.get("tilt") or {}
+    if tilt.get("apply"):
+        gain_db += float(tilt["tilt_db_per_octave"]) * np.log2(np.maximum(f, 50.0) / 1000.0)
+
+    low = params.get("low_shelf") or {}
+    if low.get("apply"):
+        gain_db += float(low["gain_db"]) * (1.0 - _shelf_weight(f, float(low["corner_hz"])))
+
+    high = params.get("high_shelf") or {}
+    if high.get("apply"):
+        gain_db += float(high["gain_db"]) * _shelf_weight(f, float(high["corner_hz"]))
+
+    lowpass = params.get("lowpass") or {}
+    if lowpass.get("apply"):
+        fc = float(lowpass["fc_hz"])
+        gain_db += -10.0 * np.log10(1.0 + (f / fc) ** 8)
+
+    return np.power(10.0, gain_db / 20.0)
+
+
+def apply_spectral_augment(
+    waveform: np.ndarray,
+    sr: int = TARGET_SR,
+    rng: np.random.Generator | None = None,
+    params: Dict[str, Dict[str, float]] | None = None,
+) -> np.ndarray:
+    """Class-agnostic spectral augmentation: one rfft gain curve, then irfft.
+
+    Length-preserving, float32, finite. When ``params`` is omitted they are drawn
+    via :func:`_sample_spectral_params` so callers never branch on content.
+    """
+    x = np.asarray(waveform, dtype=np.float32).reshape(-1)
+    if x.size < 8:
+        return x.astype(np.float32, copy=False)
+    if params is None:
+        params = _sample_spectral_params(rng or np.random.default_rng(), sr)
+    spec = np.fft.rfft(x)
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / float(sr))
+    y = np.fft.irfft(spec * _spectral_gain_linear(freqs, params), n=x.size)
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    return y.astype(np.float32)
+
+
 def degrade_for_eval(
     waveform: np.ndarray,
     condition: EvalCondition,
@@ -185,14 +285,23 @@ class TrainCodecAugmenter:
         p_codec: float = 0.6,
         p_noise: float = 0.5,
         p_clip: float = 0.15,
+        p_lowpass: float = 0.4,
+        p_low_shelf: float = 0.6,
+        p_high_shelf: float = 0.6,
+        p_tilt: float = 0.6,
         allow_inline_opus: bool = False,
         seed: int | None = None,
     ) -> None:
         self.p_codec = p_codec
         self.p_noise = p_noise
         self.p_clip = p_clip
+        self.p_lowpass = p_lowpass
+        self.p_low_shelf = p_low_shelf
+        self.p_high_shelf = p_high_shelf
+        self.p_tilt = p_tilt
         self.allow_inline_opus = allow_inline_opus and has_ffmpeg()
         self.rng = np.random.default_rng(seed)
+        self.last_spectral_params: Dict[str, Dict[str, float]] | None = None
 
     def reseed(self, seed: int) -> None:
         self.rng = np.random.default_rng(seed)
@@ -212,6 +321,11 @@ class TrainCodecAugmenter:
                 x = apply_opus_codec(x, sr=sr, bitrate_kbps=bitrate)
             else:
                 x = apply_phone_8k(x, sr=sr)
+        spectral_params = _sample_spectral_params(
+            self.rng, sr, self.p_lowpass, self.p_low_shelf, self.p_high_shelf, self.p_tilt
+        )
+        self.last_spectral_params = spectral_params
+        x = apply_spectral_augment(x, sr=sr, params=spectral_params)
         if self.rng.random() < self.p_noise:
             snr = float(self.rng.uniform(8.0, 25.0))
             x = apply_additive_noise(x, snr_db=snr, rng=self.rng)

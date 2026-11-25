@@ -5,8 +5,9 @@ set -euo pipefail
 # CloakBreak — End-to-End GPU Smoke Pipeline (< 4 min)
 # Reusable across Sessions 1-4 before committing to multi-hour runs.
 # Exercises: dataset build (40 InTheWild, 20 LibriSpeech, 6 Chatterbox, 4 Kokoro),
-#            shortcut audit, 20 training steps (Stage 1 + Stage 2), ONNX FP32 +
-#            INT8 quantization, ONNX eval pass, and scratch HF upload.
+#            shortcut audit + augmented-window shortcut audit, 20 training steps
+#            (Stage 1 + Stage 2), ONNX FP32 + INT8 quantization, ONNX eval pass,
+#            and scratch HF upload.
 # =============================================================================
 
 set +x
@@ -14,7 +15,7 @@ set +x
 SMOKE_DATA_DIR="${SMOKE_DATA_DIR:-data/smoke_v1}"
 SMOKE_CKPT_DIR="${SMOKE_CKPT_DIR:-checkpoints/smoke_e2e}"
 SMOKE_EVAL_JSON="${SMOKE_EVAL_JSON:-eval/smoke_results.json}"
-HF_DATASET_REPO="${HF_DATASET_REPO:-cipoklean/cloakbreak-data-v1}"
+HF_DATASET_REPO="${HF_DATASET_REPO:-Cipoklean/cloakbreak-data-v1}"
 
 echo "================================================================="
 echo "[smoke] Starting end-to-end GPU smoke pipeline at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -39,6 +40,13 @@ python3 -m src.generate_spoofs \
 echo "[smoke 2/5] Running shortcut audit on smoke manifest..."
 ALLOW_SHORTCUT_WARNING=1 python3 -m src.eval \
   --shortcut-only \
+  --manifest "$SMOKE_DATA_DIR/manifest.jsonl" \
+  --max-per-slice 100
+
+echo "[smoke 2b/5] Running augmented-window shortcut audit (pre-builds shared Opus cache)..."
+ALLOW_SHORTCUT_WARNING=1 python3 -m src.eval \
+  --shortcut-only \
+  --augment-train-windows \
   --manifest "$SMOKE_DATA_DIR/manifest.jsonl" \
   --max-per-slice 100
 

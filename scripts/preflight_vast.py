@@ -125,6 +125,11 @@ def run_import_sweep() -> None:
 def main() -> None:
     t_start = time.perf_counter()
 
+    print("\n[preflight] step 0 — HF token & dataset-namespace check (scripts.hf_auth_check)...", flush=True)
+    from scripts import hf_auth_check
+
+    hf_auth_check.main()
+
     _step("1/7 System binaries (nvidia-smi, ffmpeg libopus, espeak-ng)")
     for binary in ("nvidia-smi", "ffmpeg", "espeak-ng"):
         if shutil.which(binary) is None:

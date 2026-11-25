@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import subprocess
@@ -11,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.main import AppState, create_app
+from scripts import hf_auth_check
 from src.audio_utils import (
     TARGET_RMS,
     TARGET_SR,
@@ -22,10 +24,26 @@ from src.audio_utils import (
     pcm16_bytes_to_float32,
     rms_vad,
     save_wav_mono,
+    spectral_rolloff_hz,
     wav_to_bytes,
 )
-from src.augment import TrainCodecAugmenter, apply_opus_codec, apply_phone_8k, degrade_for_eval, precompute_opus_cache
-from src.eval import compute_eer_and_auroc, format_markdown_table, run_evaluation, run_shortcut_audit
+from src.augment import (
+    TrainCodecAugmenter,
+    _sample_spectral_params,
+    apply_opus_codec,
+    apply_phone_8k,
+    apply_spectral_augment,
+    degrade_for_eval,
+    precompute_opus_cache,
+)
+from src.eval import (
+    build_rolloff_matched_pair,
+    compute_eer_and_auroc,
+    format_markdown_table,
+    run_augmented_shortcut_audit,
+    run_evaluation,
+    run_shortcut_audit,
+)
 from src.generate_spoofs import (
     DEMO_PROMPTS,
     assert_disjoint_text_splits,
@@ -35,6 +53,7 @@ from src.generate_spoofs import (
 )
 from src.model import (
     CloakBreakDetector,
+    MockDetectorRuntime,
     OnnxDetectorRuntime,
     TorchDetectorRuntime,
     export_to_onnx,
@@ -512,19 +531,402 @@ def test_eval_cli_fail_on_shortcut_flag(tmp_path: Path) -> None:
     manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
     env_strict = {k: v for k, v in os.environ.items() if k != "ALLOW_SHORTCUT_WARNING"}
+    results_dir = tmp_path / "cli_results"
     p_fail = subprocess.run(
-        [sys.executable, "-m", "src.eval", "--shortcut-only", "--fail-on-shortcut", "--manifest", str(manifest)],
+        [
+            sys.executable, "-m", "src.eval", "--shortcut-only", "--fail-on-shortcut",
+            "--manifest", str(manifest), "--results-dir", str(results_dir),
+        ],
         env=env_strict,
         capture_output=True,
         text=True,
     )
     assert p_fail.returncode == 2
+    assert list(results_dir.glob("shortcut_audit_*.json"))
 
     env_allow = {**env_strict, "ALLOW_SHORTCUT_WARNING": "1"}
     p_ok = subprocess.run(
-        [sys.executable, "-m", "src.eval", "--shortcut-only", "--fail-on-shortcut", "--manifest", str(manifest)],
+        [
+            sys.executable, "-m", "src.eval", "--shortcut-only", "--fail-on-shortcut",
+            "--manifest", str(manifest), "--results-dir", str(results_dir),
+        ],
         env=env_allow,
         capture_output=True,
         text=True,
     )
     assert p_ok.returncode == 0
+
+
+def _make_harmonic_clip(beta: float, f0: float, dur: float, seed: int, noise_lvl: float = 0.002) -> np.ndarray:
+    """Speech-like harmonic stack; ``beta`` sets spectral-envelope slope -> rolloff_85."""
+    rng = np.random.default_rng(seed)
+    n = int(round(TARGET_SR * dur))
+    t = np.arange(n, dtype=np.float32) / TARGET_SR
+    ks = np.arange(1, int(7000.0 // f0) + 1, dtype=np.float64)
+    amps = ks ** (-beta)
+    phi = rng.uniform(0.0, 2.0 * np.pi, size=ks.size)
+    ang = (2.0 * np.pi * f0) * np.outer(t.astype(np.float64), ks)
+    y = np.sin(ang) @ (amps * np.cos(phi)) + np.cos(ang) @ (amps * np.sin(phi))
+    y = y / (float(np.max(np.abs(y))) + 1e-9)
+    y += rng.normal(0.0, noise_lvl, size=n)
+    y *= 0.6 + 0.4 * np.sin(2.0 * np.pi * 4.0 * t + rng.uniform(0.0, 2.0 * np.pi))
+    return normalize_loudness(y.astype(np.float32))
+
+
+def _write_rolloff_proxy_manifest(
+    base: Path,
+    n_per: int = 40,
+    sigma_beta: float = 0.06,
+    b_real: float = 0.795,
+    b_spoof: float = 0.852,
+) -> Path:
+    """Manifest whose model-window rolloff_85 mirrors the real failure (~1290 real vs ~970 spoof).
+
+    Harmonic beta jitter is calibrated so the UNaugmented trivial AUROC lands ~0.65
+    (real Session-1 value: 0.6459); augmentation must then push it below 0.60.
+    """
+    wav_dir = base / "wavs"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for si, split in enumerate(("train", "test")):
+        for cls, (bmean, label, gen) in enumerate(((b_real, 0, "bonafide_wild"), (b_spoof, 1, "spoof"))):
+            for i in range(n_per):
+                seed = 100000 * si + 1000 * cls + i
+                rng = np.random.default_rng(seed)
+                beta = bmean + rng.normal(0.0, sigma_beta)
+                f0 = rng.uniform(100.0, 200.0)
+                dur = rng.uniform(2.5, 4.0)
+                wav = _make_harmonic_clip(beta, f0, dur, seed + 7)
+                p = wav_dir / f"{split}_{'real' if label == 0 else 'fake'}_{i:03d}.wav"
+                save_wav_mono(p, wav, TARGET_SR)
+                rows.append({"path": str(p.relative_to(base)), "label": label, "generator": gen, "split": split})
+    manifest = base / "manifest.jsonl"
+    manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return manifest
+
+
+def test_spectral_augmentation_deterministic_and_label_free() -> None:
+    wav = _make_dummy_speech(2.5, seed=3)
+    wav_b = _make_dummy_speech(2.5, freq_hz=330.0, seed=99)
+
+    def make(seed: int) -> TrainCodecAugmenter:
+        return TrainCodecAugmenter(p_codec=0.0, p_noise=0.0, p_clip=0.0, seed=seed)
+
+    o1 = make(11)(wav, TARGET_SR)
+    o2 = make(11)(wav, TARGET_SR)
+    o3 = make(12)(wav, TARGET_SR)
+    assert o1.shape == wav.shape
+    assert o1.dtype == np.float32
+    assert np.isfinite(o1).all()
+    assert np.array_equal(o1, o2)
+    assert not np.array_equal(o1, o3)
+    assert abs(audio_rms(o1) - TARGET_RMS) < 0.01
+
+    # __call__ must never see a label
+    params = inspect.signature(TrainCodecAugmenter.__call__).parameters
+    assert not any("label" in name.lower() or name.lower() in {"y", "cls", "class", "is_real", "is_spoof"} for name in params)
+
+    # RNG consumption is content-independent: different inputs, same seed -> same sampled params + same rng state
+    a1, a2 = make(11), make(11)
+    a1(wav, TARGET_SR)
+    a2(wav_b, TARGET_SR)
+    assert a1.last_spectral_params == a2.last_spectral_params
+    assert a1.rng.random() == a2.rng.random()
+
+    # _sample_spectral_params is reproducible per seed
+    pa = _sample_spectral_params(np.random.default_rng(0), TARGET_SR)
+    pb = _sample_spectral_params(np.random.default_rng(0), TARGET_SR)
+    assert pa == pb
+    assert _sample_spectral_params(np.random.default_rng(1), TARGET_SR) != pa
+
+    # Forced low-pass measurably lowers rolloff_85 of a wideband signal
+    wide = normalize_loudness(np.random.default_rng(0).standard_normal(int(TARGET_SR * 2.5)).astype(np.float32))
+    r0 = spectral_rolloff_hz(wide, TARGET_SR)
+    off = {"apply": False, "gain_db": 0.0, "corner_hz": 300.0}
+    forced_lp = {
+        "lowpass": {"apply": True, "fc_hz": 3400.0},
+        "low_shelf": dict(off),
+        "high_shelf": {"apply": False, "gain_db": 0.0, "corner_hz": 2000.0},
+        "tilt": {"apply": False, "tilt_db_per_octave": 0.0},
+    }
+    out_lp = apply_spectral_augment(wide, TARGET_SR, params=forced_lp)
+    assert out_lp.shape == wide.shape and out_lp.dtype == np.float32 and np.isfinite(out_lp).all()
+    assert spectral_rolloff_hz(out_lp, TARGET_SR) < r0 - 100.0
+
+    # Forced negative high shelf also lowers rolloff measurably
+    forced_hs = {
+        "lowpass": {"apply": False, "fc_hz": 5000.0},
+        "low_shelf": dict(off),
+        "high_shelf": {"apply": True, "gain_db": -6.0, "corner_hz": 1000.0},
+        "tilt": {"apply": False, "tilt_db_per_octave": 0.0},
+    }
+    out_hs = apply_spectral_augment(wide, TARGET_SR, params=forced_hs)
+    assert spectral_rolloff_hz(out_hs, TARGET_SR) < r0 - 100.0
+
+
+def test_augmented_shortcut_audit_hides_rolloff_proxy(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
+    manifest = _write_rolloff_proxy_manifest(tmp_path / "proxy")
+    audit = run_augmented_shortcut_audit(manifest, max_per_split=1000, seed=42, opus_cache_dir=tmp_path / "opus_cache")
+    unaug = audit["model_window_shortcuts"]
+    aug = audit["augmented_train_window_shortcuts"]
+    print(
+        f"[proxy] unaugmented model-window AUROC={unaug['auroc']} (EER {unaug['eer_pct']}%) | "
+        f"augmented AUROC={aug['auroc']} (EER {aug['eer_pct']}%) | real-data ref 0.6459"
+    )
+    # mirrors the real Session-1 failure band, then augmentation must hide it
+    assert unaug["auroc"] >= 0.60
+    assert unaug["auroc"] <= 0.75
+    assert aug["auroc"] < 0.60
+    assert aug["shortcut_warning"] is False
+    # sanity: rolloff means reproduce the real ~1290 vs ~967 gap before augmentation
+    means = unaug["test_feature_means"]
+    assert means["real"]["rolloff_85_hz"] > means["spoof"]["rolloff_85_hz"] + 150.0
+    assert abs(means["real"]["duration_s"] - means["spoof"]["duration_s"]) < 0.01
+    assert audit["augmentation"]["p_lowpass"] == 0.4
+    assert audit["augmentation"]["p_tilt"] == 0.6
+    assert audit["seed"] == 42
+    capsys.readouterr()
+
+
+def _write_rolloff_matched_manifest(base: Path, n_per: int = 15) -> tuple[Path, list[dict]]:
+    """Train+test manifest with overlapping-but-separated rolloff distributions per class."""
+    wav_dir = base / "wavs"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+    specs = (
+        ("train", "bonafide_wild", 0, 0.80),
+        ("train", "spoof", 1, 0.90),
+        ("test", "bonafide_wild", 0, 0.80),
+        ("test", "spoof", 1, 0.90),
+        ("test", "kokoro_unseen", 1, 0.86),
+    )
+    for si, (split, gen, label, bmean) in enumerate(specs):
+        for i in range(n_per):
+            seed = 7000 + 1000 * si + i
+            rng = np.random.default_rng(seed)
+            beta = bmean + rng.normal(0.0, 0.06)
+            f0 = rng.uniform(100.0, 200.0)
+            dur = rng.uniform(2.5, 4.0)
+            wav = _make_harmonic_clip(beta, f0, dur, seed + 3)
+            p = wav_dir / f"{split}_{gen}_{i:03d}.wav"
+            save_wav_mono(p, wav, TARGET_SR)
+            rows.append({"path": str(p), "label": label, "generator": gen, "split": split})
+    manifest = base / "manifest.jsonl"
+    manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return manifest, rows
+
+
+def test_rolloff_matched_pair_and_eval_slices(tmp_path: Path) -> None:
+    manifest, rows = _write_rolloff_matched_manifest(tmp_path / "rm")
+    test_rows = [r for r in rows if r["split"] == "test"]
+    reals = [r for r in test_rows if int(r["label"]) == 0]
+    spoofs = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" not in r["generator"]]
+
+    pair, summary = build_rolloff_matched_pair(reals, spoofs, n_bins=10, max_total=16, seed=0)
+    n_real = sum(1 for r in pair if int(r["label"]) == 0)
+    n_spoof = sum(1 for r in pair if int(r["label"]) == 1)
+    assert len(pair) > 0
+    assert len(pair) <= 16
+    assert n_real == n_spoof
+    for b in summary["per_bin"]:
+        assert b["n_real"] == b["n_spoof"]
+    before = summary["rolloff_mean_hz"]["before"]
+    after = summary["rolloff_mean_hz"]["after"]
+    assert abs(after["real"] - after["spoof"]) < abs(before["real"] - before["spoof"])
+    assert summary["n_bins_used"] >= 1
+
+    eval_results_dir = tmp_path / "eval_results"
+    results = run_evaluation(
+        manifest, detector=MockDetectorRuntime(), max_per_slice=12,
+        out_json=tmp_path / "rm_eval.json", results_dir=eval_results_dir,
+    )
+    assert "rolloff_matched_clean" in results
+    rm = results["rolloff_matched_clean"]
+    assert "eer_pct" in rm["cloakbreak"] and "auroc" in rm["cloakbreak"]
+    assert "rolloff_matching" in rm
+    assert rm["rolloff_matching"]["n_bins_used"] >= 1
+    assert "rolloff_matched_unseen_kokoro_clean" in results
+    assert "rolloff_matching" in results["rolloff_matched_unseen_kokoro_clean"]
+    assert list(eval_results_dir.glob("eval_shortcut_audit_*.json"))
+    md = format_markdown_table(results)
+    assert "rolloff_matched_clean" in md
+    assert "rolloff_matched_unseen_kokoro_clean" in md
+
+
+def test_format_markdown_table_floor_rows() -> None:
+    results = {
+        "test_clean": {
+            "condition": "clean",
+            "num_clips": 4,
+            "num_real": 2,
+            "num_spoof": 2,
+            "cloakbreak": {"eer_pct": 12.5, "auroc": 0.9, "f1_at_05": 0.8, "eer_threshold": 0.4},
+            "latency_p50_ms": 1.0,
+            "latency_p95_ms": 2.0,
+        },
+        "shortcut_audit": {
+            "num_test": 20,
+            "model_window_shortcuts": {"eer_pct": 38.37, "auroc": 0.6459},
+            "clean_real_vs_kokoro_shortcuts": {"eer_pct": 41.0, "auroc": 0.61, "num_scored": 8},
+        },
+        "clean_real_fpr": {
+            "num_clean_real": 4,
+            "cloakbreak_fpr_at_05_pct": 1.0,
+            "cloakbreak_mean_prob": 0.1,
+            "cloakbreak_p95_prob": 0.2,
+        },
+    }
+    md = format_markdown_table(results)
+    assert "Floor: trivial 4-feature logistic (dur/RMS/SNR/rolloff)" in md
+    assert "Floor: trivial 4-feature logistic (clean real vs Kokoro)" in md
+    assert "0.6459" in md and "38.37" in md
+    assert "shortcut_audit" not in md
+    assert md.count("| test_clean |") == 1
+
+
+def test_eval_cli_augmented_shortcut_modes_and_results_dir(tmp_path: Path) -> None:
+    """SNR-biased fixture: huge real-noise vs clean-spoof gap survives augmentation -> exit 2 strict."""
+    bias_dir = tmp_path / "snr_biased"
+    wav_dir = bias_dir / "wavs"
+    wav_dir.mkdir(parents=True, exist_ok=True)
+    rows = []
+    rng = np.random.default_rng(0)
+    for si, split in enumerate(("train", "test")):
+        for i in range(10):
+            f0 = 180.0 + i * 4.0
+            rw = _make_dummy_speech(2.5, freq_hz=f0, seed=si * 100 + i)
+            r_wav = normalize_loudness(rw + rng.normal(0.0, 0.045, size=rw.shape[0]).astype(np.float32))
+            s_wav = normalize_loudness(_make_dummy_speech(2.5, freq_hz=f0, seed=500 + si * 100 + i))
+            rp = wav_dir / f"{split}_r{i}.wav"
+            sp = wav_dir / f"{split}_s{i}.wav"
+            save_wav_mono(rp, r_wav, TARGET_SR)
+            save_wav_mono(sp, s_wav, TARGET_SR)
+            rows.append({"path": str(rp.relative_to(bias_dir)), "label": 0, "generator": "bonafide_wild", "split": split})
+            rows.append({"path": str(sp.relative_to(bias_dir)), "label": 1, "generator": "spoof", "split": split})
+    manifest = bias_dir / "manifest.jsonl"
+    manifest.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    results_dir = tmp_path / "cli_results_aug"
+
+    env_strict = {k: v for k, v in os.environ.items() if k != "ALLOW_SHORTCUT_WARNING"}
+    base_cmd = [
+        sys.executable, "-m", "src.eval", "--shortcut-only",
+        "--manifest", str(manifest), "--results-dir", str(results_dir),
+    ]
+
+    p_plain = subprocess.run(base_cmd, env=env_strict, capture_output=True, text=True)
+    assert p_plain.returncode == 0
+    assert list(results_dir.glob(f"shortcut_audit_{bias_dir.name}_*.json"))
+
+    aug_cmd = base_cmd + ["--augment-train-windows", "--fail-on-shortcut"]
+    p_fail = subprocess.run(aug_cmd, env=env_strict, capture_output=True, text=True)
+    assert p_fail.returncode == 2
+    assert "[augmented audit] trivial AUROC" in p_fail.stdout
+    assert list(results_dir.glob(f"shortcut_audit_augmented_{bias_dir.name}_*.json"))
+
+    p_ok = subprocess.run(
+        aug_cmd, env={**env_strict, "ALLOW_SHORTCUT_WARNING": "1"}, capture_output=True, text=True
+    )
+    assert p_ok.returncode == 0
+
+
+def test_hf_auth_check_validation() -> None:
+    def whoami(role: str = "write", name: str = "Cipoklean", fine_grained: dict | None = None) -> dict:
+        token = {"role": role}
+        if fine_grained is not None:
+            token["fineGrained"] = fine_grained
+        return {"name": name, "auth": {"accessToken": token}}
+
+    msg = hf_auth_check.validate_hf_identity(whoami(), "Cipoklean/cloakbreak-data-v1")
+    assert "HF auth OK" in msg and "Cipoklean" in msg and "write" in msg
+
+    with pytest.raises(hf_auth_check.HfAuthError, match="write token"):
+        hf_auth_check.validate_hf_identity(whoami(role="read"), "Cipoklean/cloakbreak-data-v1")
+
+    with pytest.raises(hf_auth_check.HfAuthError) as exc_info:
+        hf_auth_check.validate_hf_identity(whoami(), "cipoklean/cloakbreak-data-v1")
+    assert "cipoklean" in str(exc_info.value) and "Cipoklean" in str(exc_info.value)
+
+    fg_ok = {"scoped": [{"entity": {"name": "Cipoklean"}, "permissions": ["repo.write", "repo.read"]}]}
+    msg = hf_auth_check.validate_hf_identity(
+        whoami(role="fineGrained", fine_grained=fg_ok), "Cipoklean/cloakbreak-data-v1"
+    )
+    assert "HF auth OK" in msg
+
+    fg_read_only = {"scoped": [{"entity": {"name": "Cipoklean"}, "permissions": ["repo.read"]}]}
+    with pytest.raises(hf_auth_check.HfAuthError):
+        hf_auth_check.validate_hf_identity(
+            whoami(role="fineGrained", fine_grained=fg_read_only), "Cipoklean/cloakbreak-data-v1"
+        )
+
+    fg_other_ns = {"scoped": [{"entity": {"name": "SomeoneElse"}, "permissions": ["repo.write"]}]}
+    with pytest.raises(hf_auth_check.HfAuthError):
+        hf_auth_check.validate_hf_identity(
+            whoami(role="fineGrained", fine_grained=fg_other_ns), "Cipoklean/cloakbreak-data-v1"
+        )
+
+    for bad in ("noslash", "a/b/c", "/name", "ns/", "", "two words/x"):
+        with pytest.raises(hf_auth_check.HfAuthError):
+            hf_auth_check.validate_hf_identity(whoami(), bad)
+
+
+def test_hf_auth_check_fetch_whoami_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    import urllib.error
+    import urllib.request
+
+    def fake_401(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_401)
+    with pytest.raises(hf_auth_check.HfAuthError, match="invalid or expired"):
+        hf_auth_check.fetch_whoami("tok")
+
+    def fake_neterr(req, timeout=None):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_neterr)
+    with pytest.raises(hf_auth_check.HfAuthError, match="request failed"):
+        hf_auth_check.fetch_whoami("tok")
+
+
+def test_hf_auth_check_main(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture) -> None:
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HF_DATASET_REPO", raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        hf_auth_check.main()
+    assert "HF AUTH PREFLIGHT FAIL" in str(exc_info.value)
+
+    secret = "hf_secret_token_abc123"
+    monkeypatch.setenv("HF_TOKEN", secret)
+    monkeypatch.setenv("HF_DATASET_REPO", "Cipoklean/cloakbreak-data-v1")
+    monkeypatch.setattr(
+        hf_auth_check,
+        "fetch_whoami",
+        lambda token, endpoint="https://huggingface.co": {
+            "name": "Cipoklean",
+            "auth": {"accessToken": {"role": "write"}},
+        },
+    )
+    hf_auth_check.main()
+    out = capsys.readouterr().out
+    assert "HF auth OK" in out
+    assert secret not in out
+
+
+def test_session1_script_lock_hash_and_hf_check() -> None:
+    root = Path(__file__).resolve().parent.parent
+    s1 = (root / "scripts" / "session1_vast.sh").read_text(encoding="utf-8")
+    smoke = (root / "scripts" / "smoke_e2e.sh").read_text(encoding="utf-8")
+
+    assert "sha256sum requirements-gpu.lock" in s1
+    assert "cut -d' ' -f1" in s1
+    assert 'echo "$LOCK_HASH" > logs/.s1_deps_done' in s1
+    assert "rm -f logs/.s1_preflight_done" in s1
+    assert "scripts.hf_auth_check" in s1
+    assert s1.index("scripts.hf_auth_check") < s1.index("[step 1/6]")
+    assert "Cipoklean/cloakbreak-data-v1" in s1
+    assert "Cipoklean/cloakbreak-data-v1" in smoke
+    assert "--augment-train-windows" in smoke
+
+    for rel in ("scripts/session1_vast.sh", "scripts/smoke_e2e.sh"):
+        proc = subprocess.run(["bash", "-n", str(root / rel)], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
