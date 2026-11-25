@@ -428,7 +428,15 @@ def test_app_threshold_precedence_verdict_and_min_window(
     monkeypatch.delenv("CLOAKBREAK_THRESHOLD_FILE", raising=False)
     monkeypatch.delenv("CLOAKBREAK_MODEL_PATH", raising=False)
 
+    # calibrated file pinned to a model sha, but no model loaded (mock) -> not applied
+    pinned = tmp_path / "pinned.json"
+    pinned.write_text(json.dumps({"operating_threshold": 0.9, "model_sha256": "a" * 64}))
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD_FILE", str(pinned))
+    st = AppState()
+    assert st.threshold == 0.5 and st.threshold_source == "default_0.5_model_mismatch"
+
     # default: no env, no file -> 0.5 / default_0.5
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD_FILE", str(tmp_path / "missing.json"))
     st = AppState()
     assert st.threshold == 0.5 and st.threshold_source == "default_0.5"
 

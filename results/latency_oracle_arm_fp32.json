@@ -1,0 +1,12 @@
+{
+  "model_path": "artifacts/session2/onnx/cloakbreak_fp32.onnx",
+  "machine": "aarch64",
+  "effective_cpus": 2,
+  "onnx_intra_op_threads": 2,
+  "window_sec": 2.5,
+  "num_clips": 100,
+  "warmup": 5,
+  "latency_ms_p50": 702.1,
+  "latency_ms_p95": 1218.8,
+  "latency_ms_mean": 780.8
+}

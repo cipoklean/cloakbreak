@@ -1,0 +1,4 @@
+[KEY] gate augmented_auroc=0.5794 eer=43.81 pass=true
+[KEY] eta stage=stage1_head steps_per_s=8.34 train_eta_min=10.8 projected_cost=NA
+[KEY] eta stage=stage2_finetune steps_per_s=9.23 train_eta_min=7.3 projected_cost=NA
+[KEY] int8_parity fp32_auroc=0.9740 int8_auroc=0.8680 delta=0.1060

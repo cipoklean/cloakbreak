@@ -1,0 +1,18 @@
+{
+  "num_clips": 1053,
+  "num_real": 750,
+  "num_spoof": 303,
+  "fp32": {
+    "auroc": 0.974,
+    "eer_pct": 8.67
+  },
+  "int8": {
+    "auroc": 0.868,
+    "eer_pct": 20.46
+  },
+  "auroc_abs_diff": 0.106,
+  "mean_abs_prob_diff": 0.232823,
+  "max_abs_prob_diff": 0.9995,
+  "max_auroc_diff": 0.01,
+  "passed": false
+}

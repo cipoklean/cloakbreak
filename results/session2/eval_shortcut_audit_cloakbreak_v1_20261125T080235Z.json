@@ -1,0 +1,53 @@
+{
+  "disjoint_text_check": "PASSED",
+  "features": [
+    "duration_s",
+    "rms",
+    "est_snr_db",
+    "rolloff_85_hz"
+  ],
+  "num_train": 600,
+  "num_test": 600,
+  "raw_acoustic_shortcuts": {
+    "eer_pct": 22.67,
+    "auroc": 0.8301,
+    "f1_at_05": 0.25,
+    "eer_threshold": 0.2187,
+    "shortcut_warning": true,
+    "test_feature_means": {
+      "real": {
+        "duration_s": 3.7768,
+        "rms": 0.0707,
+        "est_snr_db": 29.7465,
+        "rolloff_85_hz": 1132.2902
+      },
+      "spoof": {
+        "duration_s": 4.3768,
+        "rms": 0.0706,
+        "est_snr_db": 36.8464,
+        "rolloff_85_hz": 964.0626
+      }
+    }
+  },
+  "model_window_shortcuts": {
+    "eer_pct": 36.03,
+    "auroc": 0.7084,
+    "f1_at_05": 0.008,
+    "eer_threshold": 0.3281,
+    "shortcut_warning": true,
+    "test_feature_means": {
+      "real": {
+        "duration_s": 2.5,
+        "rms": 0.0707,
+        "est_snr_db": 26.2397,
+        "rolloff_85_hz": 1133.3065
+      },
+      "spoof": {
+        "duration_s": 2.5,
+        "rms": 0.0708,
+        "est_snr_db": 30.7737,
+        "rolloff_85_hz": 973.7765
+      }
+    }
+  }
+}

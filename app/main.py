@@ -97,9 +97,9 @@ class AppState:
                 print(f"[app] could not read threshold file {tfile}: {exc}", flush=True)
             else:
                 file_sha = data.get("model_sha256")
-                if self.model_path and file_sha:
-                    actual = _sha256_file(Path(self.model_path))
-                    if actual is not None and file_sha != actual:
+                if file_sha:
+                    actual = _sha256_file(Path(self.model_path)) if self.model_path else None
+                    if actual != file_sha:
                         print(
                             f"[app] threshold file {tfile} model_sha256 does not match "
                             f"CLOAKBREAK_MODEL_PATH — falling back to 0.5",

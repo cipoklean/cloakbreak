@@ -1,0 +1,8 @@
+[KEY] threshold op=0.9526 val_fpr=0.0493 val_tpr=0.8812 val_eer_threshold=0.7494
+[KEY] threshold_test slice=clean_real fpr=0.0467 tpr=NA
+[KEY] threshold_test slice=test_clean fpr=0.0000 tpr=0.8780
+[KEY] threshold_test slice=test_opus_16k fpr=0.0000 tpr=0.8780
+[KEY] threshold_test slice=unseen_kokoro_clean fpr=0.0033 tpr=0.9267
+[KEY] threshold_test slice=unseen_kokoro_opus_16k fpr=0.0033 tpr=0.9367
+[KEY] threshold_test slice=clean_real_vs_kokoro_clean fpr=0.0533 tpr=0.9267
+[KEY] threshold_test slice=clean_real_vs_kokoro_opus_16k fpr=0.0500 tpr=0.9367
