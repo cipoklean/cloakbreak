@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -9,12 +10,12 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from src.audio_utils import (
     TARGET_SR,
-    RollingAudioBuffer,
     load_wav_bytes_mono,
     pcm16_bytes_to_float32,
     resample_audio,
@@ -23,6 +24,7 @@ from src.audio_utils import (
     wav_to_bytes,
 )
 from src.augment import EvalCondition, degrade_for_eval
+from src.live import LiveScorer
 from src.model import (
     BaselineDetectorRuntime,
     DetectorRuntime,
@@ -250,9 +252,38 @@ def create_app(state: AppState | None = None) -> FastAPI:
     async def ws_detect(websocket: WebSocket) -> None:
         await websocket.accept()
         ctx: AppState = app.state.ctx
-        ring = RollingAudioBuffer(window_sec=2.5, stride_sec=0.25, sr=TARGET_SR)
-        condition: EvalCondition = "clean"
+        cond_box = {"condition": "clean"}
 
+        def score_fn(window: np.ndarray) -> dict:
+            # Runs in a worker thread via LiveScorer — never on the event loop.
+            degraded = degrade_for_eval(window, condition=cond_box["condition"], sr=TARGET_SR)
+            res = ctx.detector.predict(degraded)
+            out = {
+                "spoof_prob": res.spoof_prob,
+                "attention_focus": res.attention_focus,
+                "latency_ms": res.latency_ms,
+                "backend": res.backend,
+            }
+            if ctx.baseline is not None:
+                out["baseline_prob"] = ctx.baseline.predict_prob(degraded)
+            return out
+
+        scorer = LiveScorer(
+            score_fn,
+            ctx.threshold,
+            sr=TARGET_SR,
+            window_sec=2.5,
+            min_window_sec=ctx.min_window_sec,
+        )
+
+        async def emit(msg: dict) -> None:
+            msg = dict(msg)
+            msg["condition"] = cond_box["condition"]
+            if msg.get("backend") is None:
+                msg["backend"] = ctx.detector.backend_name
+            await websocket.send_json(msg)
+
+        scorer_task = asyncio.create_task(scorer.run(emit))
         try:
             while True:
                 message = await websocket.receive()
@@ -262,75 +293,40 @@ def create_app(state: AppState | None = None) -> FastAPI:
                 pcm_bytes = message.get("bytes")
                 if pcm_bytes is None and message.get("text"):
                     payload = json.loads(message["text"])
+                    if payload.get("type") == "stats":
+                        await websocket.send_json({"type": "stats", **scorer.stats()})
+                        continue
                     if "condition" in payload and payload["condition"] in {
                         "clean", "opus_16k", "phone_8k", "noise_10db", "noise_5db"
                     }:
-                        condition = payload["condition"]
+                        cond_box["condition"] = payload["condition"]
                     if "pcm16_b64" in payload:
                         pcm_bytes = base64.b64decode(payload["pcm16_b64"])
                     else:
-                        await websocket.send_json({"type": "ack", "condition": condition})
+                        await websocket.send_json({"type": "ack", "condition": cond_box["condition"]})
                         continue
 
                 if not pcm_bytes:
                     continue
 
-                samples = pcm16_bytes_to_float32(pcm_bytes)
-                if not ring.push(samples):
-                    continue
-
-                window = ring.get_window()
-                if ring.filled_sec < ctx.min_window_sec:
-                    await websocket.send_json({
-                        "type": "prediction",
-                        "warming_up": True,
-                        "is_speech": rms_vad(window),
-                        "spoof_prob": None,
-                        "baseline_prob": None,
-                        "attention_focus": [0.0] * 32,
-                        "latency_ms": 0.0,
-                        "backend": ctx.detector.backend_name,
-                        "condition": condition,
-                        "window_sec": round(ring.filled_sec, 2),
-                        "threshold": ctx.threshold,
-                        "verdict": None,
-                    })
-                    continue
-                speech = rms_vad(window)
-                if not speech:
-                    await websocket.send_json({
-                        "type": "prediction",
-                        "is_speech": False,
-                        "spoof_prob": None,
-                        "baseline_prob": None,
-                        "attention_focus": [0.0] * 32,
-                        "latency_ms": 0.0,
-                        "backend": ctx.detector.backend_name,
-                        "condition": condition,
-                        "window_sec": round(ring.filled_sec, 2),
-                        "threshold": ctx.threshold,
-                        "verdict": None,
-                    })
-                    continue
-
-                eval_window = degrade_for_eval(window, condition=condition, sr=TARGET_SR)
-                res = ctx.detector.predict(eval_window)
-                baseline_prob = ctx.baseline.predict_prob(eval_window) if ctx.baseline is not None else None
-                await websocket.send_json({
-                    "type": "prediction",
-                    "is_speech": True,
-                    "spoof_prob": res.spoof_prob,
-                    "baseline_prob": baseline_prob,
-                    "attention_focus": res.attention_focus,
-                    "latency_ms": res.latency_ms,
-                    "backend": res.backend,
-                    "condition": condition,
-                    "window_sec": round(ring.filled_sec, 2),
-                    "threshold": ctx.threshold,
-                    "verdict": "spoof" if res.spoof_prob >= ctx.threshold else "bonafide",
-                })
+                scorer.push(pcm16_bytes_to_float32(pcm_bytes))
         except WebSocketDisconnect:
-            return
+            pass
+        finally:
+            scorer.stop()
+            try:
+                await asyncio.wait_for(asyncio.shield(scorer_task), timeout=5.0)
+            except asyncio.TimeoutError:
+                scorer_task.cancel()
+                try:
+                    await scorer_task
+                except asyncio.CancelledError:
+                    pass
+            except asyncio.CancelledError:
+                scorer_task.cancel()
+                raise
+            except Exception as exc:
+                print(f"[ws] live scorer task ended with error: {exc}", flush=True)
 
     return app
 

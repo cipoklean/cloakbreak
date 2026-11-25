@@ -1,0 +1,65 @@
+{
+  "machine": "aarch64",
+  "effective_cpus": 2,
+  "model_path": "artifacts/session2/onnx/cloakbreak_fp32.onnx",
+  "health": {
+    "status": "ok",
+    "backend": "onnx:cloakbreak_fp32.onnx",
+    "baseline_loaded": false,
+    "baseline_id": null,
+    "clone_enabled": false,
+    "threshold": 0.95255,
+    "threshold_source": "file"
+  },
+  "duration_s": 120.0,
+  "chunk_samples": 1365,
+  "speed": 1.0,
+  "seed": 42,
+  "n_speech_verdicts": 185,
+  "n_nonspeech": 2,
+  "verdict_interval_ms": {
+    "p50": 633.6,
+    "p95": 683.0
+  },
+  "client_lag_ms": {
+    "p50": 681.3,
+    "p95": 741.5,
+    "max": 796.5
+  },
+  "server_lag_ms": {
+    "p50": 680.2,
+    "p95": 740.5,
+    "max": 795.7
+  },
+  "inference_ms": {
+    "p50": 632.9,
+    "p95": 682.1
+  },
+  "first_half_client_lag_p95_ms": 742.2,
+  "second_half_client_lag_p95_ms": 736.1,
+  "excluding_first_verdict": {
+    "client_lag_ms": {
+      "p50": 681.4,
+      "p95": 741.5,
+      "max": 796.5
+    },
+    "server_lag_ms": {
+      "p50": 680.8,
+      "p95": 740.5,
+      "max": 795.7
+    },
+    "inference_ms": {
+      "p50": 632.9,
+      "p95": 682.1
+    }
+  },
+  "stats": {
+    "type": "stats",
+    "inflight_max": 1,
+    "n_scored": 185,
+    "n_pushed_chunks": 1407,
+    "max_pending_windows": 1,
+    "dropped_windows": 187,
+    "total_sec": 120.0
+  }
+}

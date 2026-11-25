@@ -119,13 +119,18 @@
 
     <div class="grid">
       <div class="card">
-        <div class="label">CloakBreak (Spoof Probability)</div>
+        <div class="label">CloakBreak (window score → smoothed verdict)</div>
         <div class="score" id="cbScore">--</div>
         <div class="bar-track"><div class="bar-fill" id="cbBar"></div></div>
         <div class="meta-row">
           <span>Verdict: <strong id="cbVerdict">Waiting</strong></span>
+          <span>Window: <strong id="winVerdict">--</strong></span>
           <span>Threshold: <strong id="thresholdVal">--</strong></span>
           <span>Latency: <strong id="latencyVal">-- ms</strong></span>
+        </div>
+        <div class="meta-row">
+          <span>Last scores: <strong id="recentScores">--</strong></span>
+          <span id="freshVal">--</span>
         </div>
       </div>
 
@@ -183,6 +188,9 @@
       cloneBtn: document.getElementById("cloneBtn"),
       cloneAudio: document.getElementById("cloneAudio"),
       thresholdVal: document.getElementById("thresholdVal"),
+      winVerdict: document.getElementById("winVerdict"),
+      recentScores: document.getElementById("recentScores"),
+      freshVal: document.getElementById("freshVal"),
     };
 
     const ctx2d = els.canvas.getContext("2d");
@@ -213,27 +221,47 @@
       ctx2d.globalAlpha = 1.0;
     }
 
+    function verdictLabel(v) {
+      if (v === "spoof") return "FAKE";
+      if (v === "bonafide") return "REAL";
+      return "--";
+    }
+
     function renderResult(data) {
       els.vadStatus.textContent = data.is_speech ? "Speech" : "Silence";
       els.latencyVal.textContent = `${data.latency_ms ?? 0} ms`;
       if (data.threshold != null) {
         els.thresholdVal.textContent = `threshold ${Number(data.threshold).toFixed(2)}`;
       }
+      if (data.window_verdict != null) {
+        els.winVerdict.textContent = verdictLabel(data.window_verdict);
+      }
+      if (Array.isArray(data.recent_scores) && data.recent_scores.length) {
+        els.recentScores.textContent = data.recent_scores
+          .map((p) => Number(p).toFixed(2)).join("  ");
+      }
+      if (data.lag_ms != null && data.inference_ms != null) {
+        els.freshVal.textContent =
+          `scored audio ends ${(data.lag_ms / 1000).toFixed(1)}s ago · inference ${Math.round(data.inference_ms)} ms`;
+      }
       if (data.warming_up) {
         els.cbScore.textContent = "--";
         els.cbBar.style.width = "0%";
         const have = data.window_sec != null ? data.window_sec.toFixed(1) : "?";
         els.cbVerdict.textContent = `Warming up (${have}s / 2.0s)`;
+        els.cbVerdict.style.color = "";
       } else if (data.spoof_prob == null) {
         els.cbScore.textContent = "--";
         els.cbVerdict.textContent = "Listening (silence)";
+        els.cbVerdict.style.color = "";
         els.cbBar.style.width = "0%";
       } else {
         const pct = Math.round(data.spoof_prob * 100);
         els.cbScore.textContent = `${pct}%`;
         els.cbBar.style.width = `${pct}%`;
         els.cbBar.style.background = colorForProb(data.spoof_prob);
-        els.cbVerdict.textContent = data.verdict === "spoof" ? "SPOOF" : "BONAFIDE";
+        els.cbVerdict.textContent = verdictLabel(data.verdict);
+        els.cbVerdict.style.color = data.verdict === "spoof" ? "#ef4444" : "#22c55e";
       }
       if (data.baseline_prob != null) {
         const bpct = Math.round(data.baseline_prob * 100);
@@ -294,6 +322,7 @@
       ws.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
         if (data.type === "prediction") renderResult(data);
+        else if (data.type === "error") els.cbVerdict.textContent = `ERROR: ${data.detail}`;
       };
       ws.onopen = async () => {
         ws.send(JSON.stringify({ condition: els.conditionSel.value }));

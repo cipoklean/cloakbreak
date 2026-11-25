@@ -412,9 +412,32 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
         assert msg_sp.get("warming_up") is not True
         assert msg_sp["is_speech"] is True
         assert 0.0 <= msg_sp["spoof_prob"] <= 1.0
-        assert msg_sp["verdict"] in {"spoof", "bonafide"}
+        # first scored window can never reach the 2-of-3 smoothing threshold
+        assert msg_sp["verdict"] == "bonafide"
+        assert msg_sp["window_verdict"] in {"spoof", "bonafide"}
         assert msg_sp["threshold"] == 0.5
+        assert msg_sp["smoothing"] == "2_of_3"
+        assert len(msg_sp["recent_scores"]) == 1
+        assert msg_sp["audio_end_sec"] == pytest.approx(2.0)
+        assert msg_sp["lag_ms"] >= 0.0
+        assert msg_sp["inference_ms"] >= 0.0
+        assert msg_sp["dropped_windows"] == 0
         assert len(msg_sp["attention_focus"]) == 32
+
+        # stats reply exposes LiveScorer counters
+        ws.send_json({"type": "stats"})
+        stats = None
+        for _ in range(20):
+            m = ws.receive_json()
+            if m.get("type") == "stats":
+                stats = m
+                break
+        assert stats is not None
+        assert stats["inflight_max"] == 1
+        assert stats["max_pending_windows"] <= 1
+        assert stats["n_scored"] >= 1
+        assert stats["n_pushed_chunks"] == 8
+        assert stats["total_sec"] == pytest.approx(2.0)
 
 
 def test_app_threshold_precedence_verdict_and_min_window(

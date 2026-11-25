@@ -23,15 +23,15 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
  InTheWild (real + spoof) ─┐              restore dataset (19,288 clips)          mic / file
  LibriSpeech clean (real) ─┼─► loudness   │                                       │
  Chatterbox-Turbo clones ──┤   + 2.5-10 s ▼                                       ▼
-   (watermark disabled,    │   normalize  shortcut gate: trivial 4-feature        rolling 2.5 s window
+   (watermark disabled,    │   normalize  shortcut gate: trivial 4-feature        newest 2.5 s window
     disjoint text)         │              classifier on AUGMENTED windows          (decisions only after >= 2 s)
  Kokoro-82M (held out, ────┘              must score AUROC < 0.60                  │
    test only, disjoint text)              │                                       ▼
                                           ▼                                       fp32 ONNX WavLM detector
                             WavLM-Base-Plus + attentive stats pooling               │
                             stage 1: head (2 epochs) / stage 2: top 6 layers (6)   ▼
-                            augmentation: Opus 16k, phone 8k, noise, clipping,     spoof prob vs val-calibrated
-                            low-pass / shelf EQ / tilt (class-agnostic)            threshold 0.9526 + attention
+                            augmentation: Opus 16k, phone 8k, noise, clipping,     window score vs threshold 0.9526,
+                            low-pass / shelf EQ / tilt (class-agnostic)            FAKE if 2 of last 3 windows hit
                                           │
                                           ▼
                             fp32 ONNX export, INT8 parity check (failed -> fp32 ships),
@@ -49,7 +49,7 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
 | Shortcut audit | `src/eval.py` | Logistic classifier on duration, RMS, estimated SNR and spectral rolloff, run as a hard gate before training |
 | Threshold calibration | `src/calibrate.py` | Picks the operating threshold on the val split only; reports test FPR/TPR without tuning on test |
 | Hugging Face Hub (private) | `src/hub.py`, `src/restore_dataset.py` | Synthetic clips, per-epoch checkpoints (preemption-safe resume), ONNX, results, logs |
-| FastAPI + WebSocket | `app/main.py`, `frontend/index.html` | Live demo: rolling windows, verdict at calibrated threshold, attention focus, condition toggles |
+| FastAPI + WebSocket | `app/main.py`, `src/live.py`, `frontend/index.html` | Live demo: one inference at a time on the newest window, stale windows dropped, 2-of-3 smoothed verdict at the calibrated threshold, raw window score, freshness (lag + inference ms), attention focus |
 
 ## Try It in 5 Minutes
 
@@ -68,7 +68,7 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
    ```bash
    CLOAKBREAK_BACKEND=mock .venv/bin/uvicorn app.main:app --port 8000
    ```
-   Open `http://localhost:8000`, allow the microphone, and talk for at least 2 seconds.
+   Open `http://localhost:8000`, allow the microphone, and talk for at least 2 seconds. The UI shows the smoothed FAKE/REAL verdict, the raw score of each window, and how old the scored audio is.
 4. With the trained model (weights are in the private repo `Cipoklean/cloakbreak-wavlm`; access required):
    ```bash
    .venv/bin/hf download Cipoklean/cloakbreak-wavlm onnx/cloakbreak_fp32.onnx --local-dir artifacts/session2
@@ -130,12 +130,13 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 - GPU latency per 2.5 s window (torch, RTX 3090, test_clean): p50 20.7 ms, p95 23.6 ms.
 - CPU reproduction: fp32 ONNX on the 2-vCPU Oracle ARM VM gave the same val AUROC (0.9740) and EER (8.67%) as the Session 2 run, and the same test_clean EER (3.73%).
 - ARM CPU latency per 2.5 s window (fp32 ONNX, 2 threads, Oracle Neoverse-N1 with 2 vCPUs, 100 test clips): p50 702.1 ms, p95 1218.8 ms (`results/latency_oracle_arm_fp32.json`).
+- Live stream on the same ARM VM (2 min, real time, fp32 ONNX): verdict lag p50 681.3 ms, p95 741.5 ms, max 796.5 ms, with one inference in flight at a time (`results/live_lag_oracle_arm_fp32.json`).
 - fp32 ONNX vs torch checkpoint on the 1,053 val clips: identical AUROC (0.9740) and EER (8.67%), max probability difference 0.0001.
-- 47 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
+- 52 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
 
 ## Honest Limits
 
-1. **Short clips are at chance.** EER is 52.54% at 0.5 s and 35.59% at 0.8 s. The demo only makes a decision once at least 2 s are buffered, scores rolling 2.5 s windows, and rejects uploads shorter than 2 s.
+1. **Short clips are at chance.** EER is 52.54% at 0.5 s and 35.59% at 0.8 s. The demo only makes a decision once at least 2 s are buffered, scores the newest 2.5 s window, and rejects uploads shorter than 2 s.
 2. **Noise hurts.** EER rises to 16.61% at 10 dB SNR and 21.02% at 5 dB SNR.
 3. **INT8 is unusable.** Dynamic INT8 quantization dropped val AUROC from 0.9740 to 0.8680, so only fp32 ships.
 4. **At 0.5, the detector flags too many real voices.** 18.17% of clean human test clips score above 0.5. The calibrated threshold (0.9526) brings that down to 4.67%, but it also lets more fakes through: TPR is 87.80% on test_clean.
@@ -145,7 +146,12 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 8. **The baseline is not a strong competitor.** Its config maps `0=real, 1=fake`, and CloakBreak reads the `fake` probability (unit-tested with both label orders). Its model card says it was trained on ASVspoof 2021 PA, a replay-attack set, so it is out of its domain on TTS clones. It flags only 0.17% of clean human clips at 0.5, which shows its labels are not flipped. It is the legacy reference, not a state-of-the-art comparison.
 9. **Opus results vary slightly with the ffmpeg/libopus build.** On the ARM VM re-run, test_opus_16k EER was 6.10% (5.76% on the Vast box) and unseen_kokoro_opus_16k was 3.67% (3.33%).
 10. **One model, one seed, about 600 clips per slice.** There are no confidence intervals. Each decision looks at a single 2.5 s window (for files, the center 2.5 s).
-11. **The ARM demo VM is slower than the stream stride.** One fp32 window takes 702 ms (p50) and 1,219 ms (p95) on the 2-vCPU Oracle VM, while the WebSocket handler runs one inference for every 0.25 s of audio it receives. On that VM the handler cannot keep up with live audio, so the delay before each decision keeps growing during a long session. Until stale windows are skipped, live demos should run on a faster machine.
+11. **On the ARM demo VM, verdicts are about 0.7 s behind live audio and arrive about every 0.63 s, not every 0.25 s.** In this run one fp32 window took 632.9 ms at p50 (702.1 ms in the separate 100-clip latency benchmark above). The live scorer runs one inference at a time, always on the newest 2.5 s window, and drops windows that went stale while it was busy. In a 2-minute real-time stream on the 2-vCPU Oracle VM (client and server on the same VM, 185 verdicts, `results/live_lag_oracle_arm_fp32.json`):
+    - verdict lag, from sending the window's last audio sample to receiving its verdict: p50 681.3 ms, p95 741.5 ms, max 796.5 ms;
+    - the lag did not grow: p95 was 742.2 ms in the first half of the stream and 736.1 ms in the second;
+    - 187 windows were dropped as stale.
+
+    The FAKE label also needs 2 of the last 3 scored windows at or above the threshold, so after a switch to fake speech it appears at least one extra verdict later. How long that takes end to end was not measured.
 
 ## Repository Structure
 
@@ -162,6 +168,7 @@ cloakbreak/
 │   ├── train.py                Two-stage training, resume, budget guard, per-epoch HF checkpoints
 │   ├── eval.py                 Eval slices, shortcut audits, rolloff matching, INT8 parity
 │   ├── calibrate.py            Val-only threshold calibration
+│   ├── live.py                 Live scorer: newest-window inference, stale-window dropping, 2-of-3 smoothing
 │   ├── hub.py                  Hugging Face upload/download helpers
 │   └── sysinfo.py              cgroup-aware CPU count
 ├── scripts/
@@ -170,11 +177,13 @@ cloakbreak/
 │   ├── smoke_e2e.sh            GPU end-to-end smoke pipeline
 │   ├── preflight_vast.py       Import sweep, hidden-backend checks, GPU check
 │   ├── bench_latency.py        CPU latency benchmark for the ONNX model
+│   ├── bench_live_lag.py       End-to-end live verdict-lag benchmark (uvicorn + WebSocket client)
 │   └── hf_auth_check.py        HF token role / namespace check
 ├── results/
 │   ├── threshold_calibration.json   Val-selected threshold + test FPR/TPR (CPU re-run)
 │   ├── calibration_cache/      Per-clip fp32 scores behind the calibration (val + test slices)
 │   ├── latency_oracle_arm_fp32.json
+│   ├── live_lag_oracle_arm_fp32.json
 │   └── session2/               Session 2 eval JSON, results table, audits, parity, key lines
 ├── tests/                      CPU test suite
 ├── pyproject.toml             pytest config (pythonpath, testpaths)
