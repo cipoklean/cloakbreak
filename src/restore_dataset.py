@@ -241,6 +241,7 @@ def restore_dataset(
     skip_upstream: bool = False,
     min_duration: float = 2.5,
     max_duration: float = 10.0,
+    splits: Iterable[str] | None = None,
 ) -> int:
     """Download snapshot, restore missing real clips, verify. Returns process exit code."""
     out_dir = Path(out_dir)
@@ -264,6 +265,26 @@ def restore_dataset(
     if not rows:
         print(f"[restore] FAIL: {manifest_path} is empty", file=sys.stderr, flush=True)
         return 2
+
+    if splits is not None:
+        wanted_splits = {str(s).strip() for s in splits if str(s).strip()}
+        if wanted_splits:
+            rows = [r for r in rows if str(r.get("split") or "") in wanted_splits]
+            per_split: Dict[str, int] = {}
+            for r in rows:
+                s = str(r.get("split") or "")
+                per_split[s] = per_split.get(s, 0) + 1
+            print(
+                f"[restore] --splits {sorted(wanted_splits)}: "
+                f"{len(rows)} manifest rows selected ({per_split})",
+                flush=True,
+            )
+            if not rows:
+                print(
+                    f"[restore] WARN: --splits {sorted(wanted_splits)} matched 0 manifest rows",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     missing_synth = [
         r for r in rows
@@ -363,6 +384,12 @@ def main() -> None:
     parser.add_argument("--skip-upstream", action="store_true", help="Verify only; never touch upstream datasets")
     parser.add_argument("--min-duration", type=float, default=2.5)
     parser.add_argument("--max-duration", type=float, default=10.0)
+    parser.add_argument(
+        "--splits",
+        type=str,
+        default=None,
+        help="Comma-separated manifest splits to restore/verify (e.g. 'val,test'); default: all",
+    )
     args = parser.parse_args()
 
     expected = args.expected_rows
@@ -387,6 +414,7 @@ def main() -> None:
         skip_upstream=args.skip_upstream,
         min_duration=args.min_duration,
         max_duration=args.max_duration,
+        splits=[s for s in args.splits.split(",")] if args.splits else None,
     )
     sys.exit(code)
 

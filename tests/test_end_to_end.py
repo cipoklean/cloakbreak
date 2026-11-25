@@ -389,18 +389,127 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
         ack = ws.receive_json()
         assert ack["type"] == "ack" and ack["condition"] == "phone_8k"
 
+        # Below the 2.0 s minimum window the detector must not run: every
+        # stride emits warming_up with spoof_prob null until 2.0 s buffered.
         silence_pcm = float32_to_pcm16_bytes(np.zeros(4000, dtype=np.float32))
         ws.send_bytes(silence_pcm)
         msg_sil = ws.receive_json()
-        assert msg_sil["is_speech"] is False
+        assert msg_sil["warming_up"] is True
         assert msg_sil["spoof_prob"] is None
+        assert msg_sil["threshold"] == 0.5
+        assert msg_sil["verdict"] is None
+        assert msg_sil["window_sec"] == pytest.approx(0.25)
 
         speech_pcm = float32_to_pcm16_bytes(wav[:4000])
-        ws.send_bytes(speech_pcm)
+        for _ in range(6):  # 0.25s silence + 6*0.25s speech = 1.75s -> still warming
+            ws.send_bytes(speech_pcm)
+            msg_w = ws.receive_json()
+            assert msg_w["warming_up"] is True
+            assert msg_w["spoof_prob"] is None
+
+        ws.send_bytes(speech_pcm)  # 8th chunk -> 2.0s buffered -> prediction
         msg_sp = ws.receive_json()
+        assert msg_sp.get("warming_up") is not True
         assert msg_sp["is_speech"] is True
         assert 0.0 <= msg_sp["spoof_prob"] <= 1.0
+        assert msg_sp["verdict"] in {"spoof", "bonafide"}
+        assert msg_sp["threshold"] == 0.5
         assert len(msg_sp["attention_focus"]) == 32
+
+
+def test_app_threshold_precedence_verdict_and_min_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import hashlib
+
+    monkeypatch.setenv("CLOAKBREAK_BACKEND", "mock")
+    monkeypatch.setenv("ENABLE_CLONE_ENDPOINT", "false")
+    monkeypatch.delenv("CLOAKBREAK_THRESHOLD", raising=False)
+    monkeypatch.delenv("CLOAKBREAK_THRESHOLD_FILE", raising=False)
+    monkeypatch.delenv("CLOAKBREAK_MODEL_PATH", raising=False)
+
+    # default: no env, no file -> 0.5 / default_0.5
+    st = AppState()
+    assert st.threshold == 0.5 and st.threshold_source == "default_0.5"
+
+    # env wins over file
+    tfile = tmp_path / "thr.json"
+    tfile.write_text(json.dumps({"operating_threshold": 0.42, "model_sha256": None}))
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD_FILE", str(tfile))
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD", "0.33")
+    st = AppState()
+    assert st.threshold == 0.33 and st.threshold_source == "env"
+
+    # file used when env absent
+    monkeypatch.delenv("CLOAKBREAK_THRESHOLD")
+    st = AppState()
+    assert st.threshold == 0.42 and st.threshold_source == "file"
+
+    # sha mismatch vs CLOAKBREAK_MODEL_PATH -> 0.5 default_0.5_model_mismatch
+    model_file = tmp_path / "model.bin"
+    model_file.write_bytes(b"fake-model-bytes")
+    real_sha = hashlib.sha256(b"fake-model-bytes").hexdigest()
+    tfile.write_text(json.dumps({"operating_threshold": 0.42, "model_sha256": "0" * 64}))
+    monkeypatch.setenv("CLOAKBREAK_MODEL_PATH", str(model_file))
+    st = AppState()
+    assert st.threshold == 0.5 and st.threshold_source == "default_0.5_model_mismatch"
+
+    # sha match -> file threshold honored
+    tfile.write_text(json.dumps({"operating_threshold": 0.42, "model_sha256": real_sha}))
+    st = AppState()
+    assert st.threshold == 0.42 and st.threshold_source == "file"
+
+    # min window clamps to >= 2.0 and honors larger env values
+    monkeypatch.setenv("CLOAKBREAK_MIN_WINDOW_SEC", "1.0")
+    assert AppState().min_window_sec == 2.0
+    monkeypatch.setenv("CLOAKBREAK_MIN_WINDOW_SEC", "3.5")
+    assert AppState().min_window_sec == 3.5
+    monkeypatch.delenv("CLOAKBREAK_MIN_WINDOW_SEC")
+
+    # health exposes threshold + source; detect-file adds threshold + verdict
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD", "0.33")
+    client = TestClient(create_app(AppState()))
+    h = client.get("/api/health").json()
+    assert h["threshold"] == 0.33 and h["threshold_source"] == "env"
+
+    wav_bytes = wav_to_bytes(_make_dummy_speech(2.5), TARGET_SR)
+    r = client.post(
+        "/api/detect-file",
+        files={"file": ("t.wav", wav_bytes, "audio/wav")},
+        data={"condition": "clean"},
+    )
+    assert r.status_code == 200
+    d = r.json()
+    assert d["threshold"] == 0.33
+    assert d["verdict"] in {"spoof", "bonafide"}
+    # verdict must be consistent with the reported prob and threshold
+    assert d["verdict"] == ("spoof" if d["spoof_prob"] >= d["threshold"] else "bonafide")
+
+    # mock prob is in [0.02, 0.98]: 0.99 -> bonafide, 0.01 -> spoof
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD", "0.99")
+    hi = TestClient(create_app(AppState())).post(
+        "/api/detect-file",
+        files={"file": ("t.wav", wav_bytes, "audio/wav")},
+        data={"condition": "clean"},
+    ).json()
+    assert hi["verdict"] == "bonafide"
+    monkeypatch.setenv("CLOAKBREAK_THRESHOLD", "0.01")
+    lo = TestClient(create_app(AppState())).post(
+        "/api/detect-file",
+        files={"file": ("t.wav", wav_bytes, "audio/wav")},
+        data={"condition": "clean"},
+    ).json()
+    assert lo["verdict"] == "spoof"
+
+    # detect-file rejects audio under the 2.0 s minimum window
+    short_bytes = wav_to_bytes(_make_dummy_speech(1.0), TARGET_SR)
+    r_short = client.post(
+        "/api/detect-file",
+        files={"file": ("s.wav", short_bytes, "audio/wav")},
+        data={"condition": "clean"},
+    )
+    assert r_short.status_code == 400
+    assert "need at least 2.0 s of audio" in r_short.json()["detail"]
 
 
 def test_fastapi_private_clone_auth_and_onnx_backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

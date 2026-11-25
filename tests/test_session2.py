@@ -22,6 +22,7 @@ from src.audio_utils import (
     load_wav_bytes_mono,
     load_wav_mono,
     normalize_loudness,
+    pad_or_crop,
     save_wav_mono,
     wav_to_bytes,
 )
@@ -563,6 +564,13 @@ def _run_session2_dry_run(
 
 
 def test_session2_dry_run_end_to_end(s2_dataset: tuple[Path, Path], tmp_path: Path) -> None:
+    stray_paths = (
+        REPO_ROOT / "data" / "cloakbreak_v1",
+        REPO_ROOT / "checkpoints" / "s2_smoke",
+        REPO_ROOT / "results" / "smoke",
+        REPO_ROOT / "logs" / "session2.log",
+    )
+    stray_before = {p: (p.stat().st_mtime if p.exists() else None) for p in stray_paths}
     proc, log_dir, ckpt_dir, results_dir, data_dir = _run_session2_dry_run(s2_dataset, tmp_path)
     out = proc.stdout + proc.stderr
     assert proc.returncode == 0, out[-5000:]
@@ -610,14 +618,15 @@ def test_session2_dry_run_end_to_end(s2_dataset: tuple[Path, Path], tmp_path: Pa
         r"^\[KEY\] smoke used_min=\d+\.\d cap_min=\d+\.\d setup_min=\d+\.\d complete=true$",
         content, re.M,
     )
-    # Nothing leaked into the repo working dirs.
-    for stray in (
-        REPO_ROOT / "data" / "cloakbreak_v1",
-        REPO_ROOT / "checkpoints" / "s2_smoke",
-        REPO_ROOT / "results" / "smoke",
-        REPO_ROOT / "logs" / "session2.log",
-    ):
-        assert not stray.exists(), stray
+    # Nothing leaked into the repo working dirs: paths absent before the run
+    # must still be absent; pre-existing paths (e.g. a real restored dataset
+    # under the gitignored data/) must be unmodified.
+    for stray in stray_paths:
+        before = stray_before[stray]
+        if before is None:
+            assert not stray.exists(), stray
+        else:
+            assert stray.exists() and stray.stat().st_mtime == before, stray
 
     # Rerun with same LOG_DIR/CKPT_DIR/RESULTS_DIR -> markers skip finished steps.
     data_dir2 = data_dir
@@ -706,3 +715,381 @@ def test_no_tmux_new_in_scripts() -> None:
     for p in (REPO_ROOT / "scripts").rglob("*"):
         if p.is_file():
             assert "tmux new" not in p.read_text(errors="ignore"), p
+
+
+def test_preflight_transformers_backends_collecting() -> None:
+    """check_transformers_backends must report zero failures on the pinned env.
+
+    This is the check that crashed on transformers 5.2.0 (is_safetensors_available
+    was removed); running it with a collecting check() reproduces that failure
+    mode without needing the full hidden-backend suite.
+    """
+    from scripts import preflight_vast
+
+    failures: list[str] = []
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        if not ok:
+            failures.append(f"{label}: {detail}")
+
+    preflight_vast.check_transformers_backends(check)
+    assert failures == []
+
+
+def test_baseline_detector_label_mapping(tmp_path: Path) -> None:
+    """BaselineDetectorRuntime.fake_idx must follow the checkpoint's id2label.
+
+    Vansh180 ships {0: real, 1: fake} -> fake_idx 1; a flipped config must give
+    fake_idx 0. predict_prob must equal softmax(model(extractor(x)))[fake_idx].
+    """
+    from transformers import (
+        Wav2Vec2Config,
+        Wav2Vec2FeatureExtractor,
+        Wav2Vec2ForSequenceClassification,
+    )
+
+    from src.model import BaselineDetectorRuntime
+
+    torch.manual_seed(0)
+    cfg = Wav2Vec2Config(
+        hidden_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=37,
+        conv_dim=[16, 16],
+        conv_kernel=[3, 3],
+        conv_stride=[2, 2],
+        feat_extract_norm="group",
+        vocab_size=32,
+        pad_token_id=0,
+        num_labels=2,
+    )
+    x = _make_dummy_speech(duration_s=2.5, freq_hz=220.0, seed=3)
+
+    for tag, id2label, expect_idx in (
+        ("normal", {0: "real", 1: "fake"}, 1),
+        ("flipped", {0: "fake", 1: "real"}, 0),
+    ):
+        model = Wav2Vec2ForSequenceClassification(cfg)
+        model.config.id2label = {int(k): v for k, v in id2label.items()}
+        model.config.label2id = {v: int(k) for k, v in id2label.items()}
+        ckpt_dir = tmp_path / tag
+        model.save_pretrained(ckpt_dir)
+        Wav2Vec2FeatureExtractor().save_pretrained(ckpt_dir)
+
+        rt = BaselineDetectorRuntime(str(ckpt_dir), device="cpu")
+        assert rt.fake_idx == expect_idx, (tag, rt.fake_idx)
+
+        fixed = normalize_loudness(pad_or_crop(x, rt.window_samples, random_crop=False))
+        inputs = rt.extractor(fixed, sampling_rate=TARGET_SR, return_tensors="pt", padding=True)
+        inputs = {k: v.to(rt.device) for k, v in inputs.items()}
+        with torch.inference_mode():
+            logits = rt.model(**inputs).logits
+        probs = torch.softmax(logits, dim=-1)[0]
+        expected = round(float(probs[expect_idx].item()), 4)
+        assert rt.predict_prob(x) == expected, (tag, rt.predict_prob(x), expected)
+
+
+def test_sysinfo_effective_cpu_count(tmp_path: Path) -> None:
+    from src.sysinfo import effective_cpu_count
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    base = effective_cpu_count(str(empty))
+    assert base >= 1
+
+    # cgroup v2 quota 400000/100000 -> ceil(4.0) = 4 (or lower if affinity is tighter)
+    v2 = tmp_path / "v2"
+    v2.mkdir()
+    (v2 / "cpu.max").write_text("400000 100000\n")
+    assert effective_cpu_count(str(v2)) <= 4
+
+    # v2 "max" quota -> ignored, same as empty
+    v2max = tmp_path / "v2max"
+    v2max.mkdir()
+    (v2max / "cpu.max").write_text("max 100000\n")
+    assert effective_cpu_count(str(v2max)) == base
+
+    # cgroup v1 cpu/ quota 200000/100000 -> <= 2
+    v1 = tmp_path / "v1"
+    (v1 / "cpu").mkdir(parents=True)
+    (v1 / "cpu" / "cpu.cfs_quota_us").write_text("200000\n")
+    (v1 / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    assert effective_cpu_count(str(v1)) <= 2
+
+    # cgroup v1 cpu,cpuacct/ variant -> <= 3
+    v1alt = tmp_path / "v1alt"
+    (v1alt / "cpu,cpuacct").mkdir(parents=True)
+    (v1alt / "cpu,cpuacct" / "cpu.cfs_quota_us").write_text("300000\n")
+    (v1alt / "cpu,cpuacct" / "cpu.cfs_period_us").write_text("100000\n")
+    assert effective_cpu_count(str(v1alt)) <= 3
+
+    # v1 quota -1 -> unlimited -> ignored
+    v1unlim = tmp_path / "v1unlim"
+    (v1unlim / "cpu").mkdir(parents=True)
+    (v1unlim / "cpu" / "cpu.cfs_quota_us").write_text("-1\n")
+    (v1unlim / "cpu" / "cpu.cfs_period_us").write_text("100000\n")
+    assert effective_cpu_count(str(v1unlim)) == base
+
+
+def test_restore_dataset_splits_filter(s2_dataset: tuple[Path, Path], capsys) -> None:
+    """--splits restricts restore+verify to the listed manifest splits."""
+    data_dir, manifest = s2_dataset
+    rows = [json.loads(line) for line in manifest.read_text().splitlines() if line.strip()]
+    train_row = next(r for r in rows if r.get("split") == "train")
+    victim = data_dir / str(train_row["path"])
+    assert victim.exists()
+    victim.unlink()
+
+    # val-only restore ignores the deleted train clip
+    rc = restore_dataset(
+        repo_id="unused", out_dir=data_dir,
+        skip_download=True, skip_upstream=True, splits={"val"},
+    )
+    assert rc == 0
+    assert "--splits ['val']" in capsys.readouterr().out
+
+    # train-only restore must fail verification on the missing clip
+    rc2 = restore_dataset(
+        repo_id="unused", out_dir=data_dir,
+        skip_download=True, skip_upstream=True, splits={"train"},
+    )
+    assert rc2 == 2
+
+
+def _calib_manifest(tmp_path: Path) -> tuple[Path, list[float]]:
+    """Write wavs + manifest.jsonl for calibrate tests.
+
+    Returns (manifest_path, val_probs_in_call_order). val rows are written first
+    in manifest order: 20 real then 10 spoof, all split='val' non-Kokoro.
+    Test rows follow: 2 bonafide_wild + 2 bonafide_clean reals, 2 chatterbox
+    spoofs, 2 kokoro_unseen spoofs (all split='test').
+    """
+    data = tmp_path / "calib_data"
+    wavs = data / "wavs"
+    wavs.mkdir(parents=True)
+    rows: list[dict] = []
+    n = 0
+
+    def add(split: str, label: int, gen: str) -> None:
+        nonlocal n
+        name = f"c{n:03d}.wav"
+        save_wav_mono(wavs / name, _make_dummy_speech(0.5, seed=n), TARGET_SR)
+        rows.append({
+            "id": f"r{n:03d}",
+            "path": f"wavs/{name}",
+            "label": label,
+            "generator": gen,
+            "split": split,
+            "speaker_id": f"spk{n % 7}",
+            "duration_s": 0.5,
+        })
+        n += 1
+
+    val_real_probs = [0.5, 0.4, 0.3, 0.2, 0.1] + [0.05] * 15
+    val_spoof_probs = [0.9, 0.85, 0.8, 0.7, 0.6, 0.55, 0.5, 0.45, 0.3, 0.2]
+    assert len(val_real_probs) == 20 and len(val_spoof_probs) == 10
+    for i in range(20):
+        add("val", 0, "bonafide_wild" if i % 2 == 0 else "bonafide_clean")
+    for _ in range(10):
+        add("val", 1, "chatterbox_mock")
+    for _ in range(2):
+        add("test", 0, "bonafide_wild")
+    for _ in range(2):
+        add("test", 0, "bonafide_clean")
+    for _ in range(2):
+        add("test", 1, "chatterbox_mock")
+    for _ in range(2):
+        add("test", 1, "kokoro_unseen")
+
+    manifest = data / "manifest.jsonl"
+    manifest.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return manifest, val_real_probs + val_spoof_probs
+
+
+class _QueueRuntime:
+    """DetectorRuntime stub returning crafted probs in exact call order."""
+
+    backend_name = "queue_stub"
+
+    def __init__(self, probs: list[float]) -> None:
+        self._probs = [float(p) for p in probs]
+        self.calls = 0
+
+    def predict(self, waveform):
+        from src.model import DetectionResult
+
+        assert self.calls < len(self._probs), "runtime called more times than planned"
+        p = self._probs[self.calls]
+        self.calls += 1
+        return DetectionResult(
+            spoof_prob=round(p, 4),
+            attention_focus=[0.0] * 32,
+            latency_ms=0.1,
+            backend=self.backend_name,
+        )
+
+
+def test_select_operating_threshold_rule() -> None:
+    from src.calibrate import select_operating_threshold
+
+    desc = [0.9, 0.5, 0.4, 0.3, 0.2, 0.1]
+    # k = floor(0.5 * 6) = 3 -> t = desc[3] + eps
+    assert select_operating_threshold(desc, 0.5) == pytest.approx(0.30005)
+    # k >= n_real -> min prob
+    assert select_operating_threshold(desc, 1.0) == pytest.approx(0.1)
+    assert select_operating_threshold(desc, 2.0) == pytest.approx(0.1)
+    # achieved FPR never exceeds target under prob >= t
+    probs = [0.9, 0.8, 0.7, 0.6, 0.1, 0.05, 0.04, 0.03, 0.02, 0.01]
+    t = select_operating_threshold(sorted(probs, reverse=True), 0.3)
+    fpr = sum(1 for p in probs if p >= t) / len(probs)
+    assert fpr <= 0.3
+
+
+def test_calibrate_threshold_and_report(tmp_path: Path, capsys) -> None:
+    """End-to-end calibrate run with a queue stub: exact threshold rule, schema,
+    per-generator counts, KEY lines, and the two clean_real_vs_kokoro slices."""
+    import hashlib
+
+    from src import calibrate
+
+    manifest, val_probs = _calib_manifest(tmp_path)
+    # 18 test predict calls: cache files are shared per (tag, condition, seed);
+    # test_clean/unseen_kokoro_clean/crk_clean share tag__clean__s1000 and the
+    # rw1/rw2/rc1/rc2/k1/k2 rows dedupe across slices (2+4+4+2+2+2+2 = 18).
+    test_probs = [round(0.05 + 0.02 * i, 4) for i in range(18)]
+    runtime = _QueueRuntime(val_probs + test_probs)
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"fake-onnx-bytes")
+
+    out_json = tmp_path / "thr.json"
+    key_file = tmp_path / "key_lines.txt"
+    report = calibrate.run_calibration(
+        manifest, runtime,
+        model_path=str(model_file), backend="onnx", cache_tag="t1",
+        target_fpr=0.05, max_per_slice=8,
+        cache_dir=tmp_path / "cache", key_lines_path=key_file, out_path=out_json,
+    )
+
+    # exact rule: k = floor(0.05*20) = 1 -> t = 2nd highest real prob + eps
+    assert report["operating_threshold"] == pytest.approx(0.40005)
+    val_op = report["val"]["at_operating_threshold"]
+    assert val_op["fpr"] == pytest.approx(0.05)  # == target, never above
+    assert val_op["tpr"] == pytest.approx(0.8)
+    assert val_op["fpr_by_generator"]["bonafide_wild"] == pytest.approx(0.1)
+    assert val_op["fpr_by_generator"]["bonafide_clean"] == pytest.approx(0.0)
+
+    for key in (
+        "model_path", "model_sha256", "backend", "target_fpr", "selection",
+        "operating_threshold", "val", "val_eer_threshold", "test",
+        "torch_parity", "created_utc",
+    ):
+        assert key in report, key
+    assert report["selection"] == "val split only; test never used for selection"
+    assert report["model_sha256"] == hashlib.sha256(b"fake-onnx-bytes").hexdigest()
+    assert report["torch_parity"] is None
+
+    expected_slices = {
+        "clean_real", "test_clean", "test_opus_16k",
+        "unseen_kokoro_clean", "unseen_kokoro_opus_16k",
+        "clean_real_vs_kokoro_clean", "clean_real_vs_kokoro_opus_16k",
+    }
+    assert set(report["test"]) == expected_slices
+    for name, blk in report["test"].items():
+        assert "rows_by_generator" in blk, name
+        assert blk["n_real"] + blk["n_spoof"] == blk["n_clips"], name
+        for sub in ("at_operating_threshold", "at_eer_threshold", "at_0.5"):
+            assert sub in blk, (name, sub)
+    assert report["test"]["test_clean"]["rows_by_generator"] == {
+        "bonafide_wild": 2, "chatterbox_mock": 2,
+    }
+    assert report["test"]["unseen_kokoro_clean"]["rows_by_generator"] == {
+        "bonafide_wild": 2, "kokoro_unseen": 2,
+    }
+    assert report["test"]["clean_real_vs_kokoro_clean"]["rows_by_generator"] == {
+        "bonafide_clean": 2, "kokoro_unseen": 2,
+    }
+    assert report["test"]["clean_real"]["n_spoof"] == 0
+    assert report["test"]["clean_real"]["at_operating_threshold"]["tpr"] is None
+
+    out = capsys.readouterr().out
+    lines = [ln for ln in out.splitlines() if ln.startswith("[KEY]")]
+    assert any(ln.startswith("[KEY] threshold op=") for ln in lines)
+    assert sum(1 for ln in lines if ln.startswith("[KEY] threshold_test")) == 7
+    cr_line = next(ln for ln in lines if "slice=clean_real " in ln)
+    assert "tpr=NA" in cr_line
+    kf = key_file.read_text(encoding="utf-8")
+    assert "[KEY] threshold op=" in kf
+    assert kf.count("[KEY] threshold_test") == 7
+
+    saved = json.loads(out_json.read_text(encoding="utf-8"))
+    assert saved["operating_threshold"] == report["operating_threshold"]
+    assert saved["test"]["clean_real_vs_kokoro_opus_16k"]["rows_by_generator"] == {
+        "bonafide_clean": 2, "kokoro_unseen": 2,
+    }
+
+
+def test_calibrate_test_scores_do_not_change_threshold(tmp_path: Path) -> None:
+    """TEST-slice scores are report-only: different test probs -> same threshold."""
+    from src import calibrate
+
+    manifest, val_probs = _calib_manifest(tmp_path)
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+
+    def _run(tag: str, test_probs: list[float]) -> dict:
+        rt = _QueueRuntime(val_probs + test_probs)
+        return calibrate.run_calibration(
+            manifest, rt,
+            model_path=str(model_file), backend="onnx", cache_tag=tag,
+            target_fpr=0.05, max_per_slice=8,
+            cache_dir=cache_dir, progress_every=1000,
+        )
+
+    probs_a = [round(0.05 + 0.02 * i, 4) for i in range(18)]
+    probs_b = [round(0.9 - 0.04 * i, 4) for i in range(18)]
+    r1 = _run("tagA", probs_a)
+    r2 = _run("tagB", probs_b)
+    assert r1["operating_threshold"] == pytest.approx(0.40005)
+    assert r2["operating_threshold"] == pytest.approx(0.40005)
+    assert r1["val"]["auroc"] == r2["val"]["auroc"]
+    # test blocks genuinely differ (different crafted probs)
+    assert r1["test"] != r2["test"]
+
+
+def test_calibrate_cache_resume_skips_predict(tmp_path: Path) -> None:
+    """A second run over the same cache_dir+tag must not call predict at all."""
+    from src import calibrate
+
+    manifest, val_probs = _calib_manifest(tmp_path)
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"x")
+    cache_dir = tmp_path / "cache"
+
+    rt1 = _QueueRuntime(val_probs + [0.5] * 18)
+    r1 = calibrate.run_calibration(
+        manifest, rt1, model_path=str(model_file), backend="onnx",
+        cache_tag="resume", target_fpr=0.05, max_per_slice=8,
+        cache_dir=cache_dir, progress_every=1000,
+    )
+    assert rt1.calls == 48  # 30 val + 18 test (shared-cache dedup across slices)
+
+    class _BoomRuntime:
+        backend_name = "boom"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict(self, waveform):
+            self.calls += 1
+            raise AssertionError("predict called — score cache missed")
+
+    boom = _BoomRuntime()
+    r2 = calibrate.run_calibration(
+        manifest, boom, model_path=str(model_file), backend="onnx",
+        cache_tag="resume", target_fpr=0.05, max_per_slice=8,
+        cache_dir=cache_dir, progress_every=1000,
+    )
+    assert boom.calls == 0
+    assert r2["operating_threshold"] == r1["operating_threshold"]

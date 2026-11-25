@@ -115,6 +115,15 @@ mkdir -p "$LOG_DIR" "$RESULTS_DIR" "$CKPT_DIR"
 export HF_DATASET_REPO HF_MODEL_REPO
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
 
+# Effective CPU count respects cgroup quotas (os.cpu_count()/nproc report the
+# host's vCPUs on quota-limited Vast boxes and oversubscribe worker pools).
+CB_CPUS="$("$PYTHON" -m src.sysinfo 2>/dev/null || nproc)"
+CB_THREADS=$(( CB_CPUS < 8 ? CB_CPUS : 8 ))
+export OMP_NUM_THREADS="$CB_THREADS" MKL_NUM_THREADS="$CB_THREADS" \
+  OPENBLAS_NUM_THREADS="$CB_THREADS" NUMEXPR_NUM_THREADS="$CB_THREADS" \
+  TOKENIZERS_PARALLELISM=false
+echo "[session2] cgroup CPUs=$CB_CPUS threads=$CB_THREADS"
+
 # Grep-able [KEY] summary lines: printed to the log AND appended to
 # $RESULTS_DIR/key_lines.txt (uploaded with results/ by step 7 / budget stop).
 # The file is append-only so reruns accumulate lines across invocations.
@@ -303,7 +312,7 @@ echo "[session2] Started at $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 echo "[session2] Dataset repo: ${HF_DATASET_REPO} | Model repo: ${HF_MODEL_REPO}"
 echo "[session2] SMOKE=${SMOKE} DRY_RUN=${DRY_RUN} MAX_HOURS=${MAX_HOURS} RESUME=${RESUME}"
 echo "[session2] Session deadline (UTC): $(date -u -d "@$SESSION_DEADLINE" '+%Y-%m-%d %H:%M:%S') | train deadline (UTC): $(date -u -d "@$TRAIN_DEADLINE" '+%Y-%m-%d %H:%M:%S')"
-echo "[session2] Host vCPUs: $(nproc)"
+echo "[session2] Host vCPUs: $(nproc) | cgroup-effective CPUs: $CB_CPUS | threads: $CB_THREADS"
 echo "================================================================="
 
 # ---- budget helpers ---------------------------------------------------------
@@ -511,7 +520,9 @@ if [ ! -f "$LOG_DIR/${MP}_parity_done" ]; then
   parity_rc=$?
   set -e
   emit_int8_key
-  if [ "$parity_rc" -ne 0 ]; then
+  if [ "$parity_rc" -eq 4 ]; then
+    echo "[step 5] WARNING: INT8 parity FAILED (see $RESULTS_DIR/int8_parity_*.json) — falling back to fp32; INT8 will not be uploaded as a deployable artifact."
+  elif [ "$parity_rc" -ne 0 ]; then
     echo "[step 5] INT8 parity check FAILED (rc=$parity_rc) — see $RESULTS_DIR/int8_parity_*.json"
     exit "$parity_rc"
   fi
@@ -522,13 +533,13 @@ fi
 
 check_budget
 
-# ---- step 6: full benchmark eval (int8 ONNX vs optional baseline) ------------
+# ---- step 6: full benchmark eval (fp32 torch checkpoint vs optional baseline) -
 if [ ! -f "$LOG_DIR/${MP}_eval_done" ]; then
-  echo "[step 6/8] Running full evaluation (int8 ONNX${BASELINE_ID:+ vs $BASELINE_ID})..."
+  echo "[step 6/8] Running full evaluation (fp32 torch${BASELINE_ID:+ vs $BASELINE_ID})..."
   eval_args=(
     --manifest "$DATA_DIR/manifest.jsonl"
-    --backend onnx
-    --model-path "$CKPT_DIR/cloakbreak_int8.onnx"
+    --backend torch
+    --model-path "$CKPT_DIR/cloakbreak_best.pt"
     --device "$DEVICE"
     --max-per-slice "$EVAL_MAX_PER_SLICE"
     --out-json "$RESULTS_DIR/eval_results.json"
@@ -568,6 +579,16 @@ if [ ! -f "$LOG_DIR/${MP}_upload_done" ]; then
   )
   if [ "$DRY_RUN" = "1" ]; then
     upload_args+=(--dry-run)
+  fi
+  # INT8 parity failed (rc 4 is non-fatal since we eval fp32): don't upload the
+  # int8 ONNX as a deployable artifact.
+  parity_json="$(ls -t "$RESULTS_DIR"/int8_parity_*.json 2>/dev/null | head -1 || true)"
+  if [ -n "$parity_json" ]; then
+    parity_passed="$("$PYTHON" -c "import json,sys; print(json.load(open(sys.argv[1])).get('passed'))" "$parity_json" 2>/dev/null || true)"
+    if [ "$parity_passed" = "False" ]; then
+      upload_args+=(--exclude-int8)
+      echo "[step 7] newest parity JSON reports passed=false — uploading with --exclude-int8"
+    fi
   fi
   run_capped 7 "$PYTHON" -m src.hub "${upload_args[@]}"
   touch "$LOG_DIR/${MP}_upload_done"

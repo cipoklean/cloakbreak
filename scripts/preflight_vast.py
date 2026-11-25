@@ -58,6 +58,29 @@ def _step(name: str) -> None:
     print(f"\n[preflight] {name}...", flush=True)
 
 
+def _importable(mod: str) -> bool:
+    try:
+        importlib.import_module(mod)
+        return True
+    except Exception:
+        return False
+
+
+def check_transformers_backends(check) -> None:
+    """transformers backend checks needing only transformers + torch + safetensors.
+
+    transformers 5.x removed ``transformers.utils.is_safetensors_available()``;
+    probe the actual backend modules instead of version-specific helpers.
+    """
+    import transformers
+    import transformers.utils
+
+    check("transformers torch backend", bool(transformers.utils.is_torch_available()))
+    check("transformers safetensors backend", _importable("safetensors.torch"))
+    for sym in ("AutoModel", "AutoModelForAudioClassification", "AutoFeatureExtractor", "WavLMModel", "Wav2Vec2ForSequenceClassification"):
+        check(f"transformers.{sym}", getattr(transformers, sym, None) is not None)
+
+
 def run_hidden_backend_checks() -> None:
     """Detect libraries that silently degrade to None behind try/except ImportError."""
     failures: list[str] = []
@@ -77,8 +100,6 @@ def run_hidden_backend_checks() -> None:
     import onnxruntime
     import onnxruntime.quantization
     import perth
-    import transformers
-    import transformers.utils
 
     check(
         "perth.PerthImplicitWatermarker callable",
@@ -90,12 +111,9 @@ def run_hidden_backend_checks() -> None:
         getattr(chatterbox.tts_turbo, "ChatterboxTurboTTS", None) is not None,
     )
     check("kokoro.KPipeline", getattr(kokoro, "KPipeline", None) is not None)
-    check("transformers torch backend", bool(transformers.utils.is_torch_available()))
-    check("transformers safetensors backend", bool(transformers.utils.is_safetensors_available()))
-    for sym in ("AutoModel", "AutoModelForAudioClassification", "AutoFeatureExtractor", "WavLMModel", "Wav2Vec2ForSequenceClassification"):
-        check(f"transformers.{sym}", getattr(transformers, sym, None) is not None)
+    check_transformers_backends(check)
     check("diffusers torch backend", bool(diffusers.utils.is_torch_available()))
-    check("diffusers safetensors backend", bool(diffusers.utils.is_safetensors_available()))
+    check("diffusers safetensors backend", _importable("safetensors.torch"))
     check("datasets.Audio & load_dataset", datasets.Audio is not None and datasets.load_dataset is not None)
     check(
         "onnxruntime InferenceSession & quantize_dynamic",

@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Sequence
@@ -29,6 +30,7 @@ from src.augment import (
     precompute_opus_cache,
 )
 from src.generate_spoofs import assert_disjoint_text_splits
+from src.sysinfo import effective_cpu_count
 from src.model import (
     DEFAULT_BASELINE_ID,
     DEFAULT_WINDOW_SAMPLES,
@@ -376,16 +378,30 @@ def run_augmented_shortcut_audit(
     }
 
 
+def _clip_rel_path(row: Dict, manifest_dir: Path | None) -> str:
+    p = str(row.get("path", ""))
+    if manifest_dir is None:
+        return p
+    try:
+        rel = os.path.relpath(p, manifest_dir)
+    except (OSError, ValueError):
+        return p
+    return rel if not rel.startswith("..") else p
+
+
 def evaluate_slice(
     rows: List[Dict],
     detector: DetectorRuntime,
     condition: EvalCondition = "clean",
     baseline: BaselineDetectorRuntime | None = None,
+    manifest_dir: Path | None = None,
 ) -> Dict:
     labels: List[int] = []
     cb_scores: List[float] = []
     base_scores: List[float] = []
     latencies: List[float] = []
+    per_clip: List[Dict] = []
+    n_rows = len(rows)
 
     for i, row in enumerate(rows):
         wav, sr = load_wav_mono(row["path"], target_sr=TARGET_SR)
@@ -394,8 +410,20 @@ def evaluate_slice(
         labels.append(int(row["label"]))
         cb_scores.append(res.spoof_prob)
         latencies.append(res.latency_ms)
+        entry: Dict = {
+            "id": row.get("id"),
+            "path": _clip_rel_path(row, manifest_dir),
+            "label": int(row["label"]),
+            "generator": str(row.get("generator", "")),
+            "cloakbreak": res.spoof_prob,
+        }
         if baseline is not None:
-            base_scores.append(baseline.predict_prob(degraded))
+            bprob = baseline.predict_prob(degraded)
+            base_scores.append(bprob)
+            entry["baseline"] = bprob
+        per_clip.append(entry)
+        if (i + 1) % 100 == 0:
+            print(f"[eval]   {i + 1}/{n_rows}", flush=True)
 
     out: Dict = {
         "condition": condition,
@@ -405,6 +433,7 @@ def evaluate_slice(
         "cloakbreak": compute_eer_and_auroc(labels, cb_scores),
         "latency_p50_ms": round(float(np.percentile(latencies, 50)), 2) if latencies else 0.0,
         "latency_p95_ms": round(float(np.percentile(latencies, 95)), 2) if latencies else 0.0,
+        "per_clip": per_clip,
     }
     if baseline is not None:
         out["baseline"] = compute_eer_and_auroc(labels, base_scores)
@@ -416,16 +445,32 @@ def evaluate_clean_real_fpr(
     detector: DetectorRuntime,
     baseline: BaselineDetectorRuntime | None = None,
     condition: EvalCondition = "clean",
+    manifest_dir: Path | None = None,
 ) -> Dict:
     """Measure false-positive rate on clean human speech alone (predicts live laptop-mic FP risk)."""
     cb_scores: List[float] = []
     base_scores: List[float] = []
+    per_clip: List[Dict] = []
+    n_rows = len(clean_real_rows)
     for i, row in enumerate(clean_real_rows):
         wav, sr = load_wav_mono(row["path"], target_sr=TARGET_SR)
         degraded = degrade_for_eval(wav, condition=condition, sr=sr, seed=2000 + i)
-        cb_scores.append(detector.predict(degraded).spoof_prob)
+        prob = detector.predict(degraded).spoof_prob
+        cb_scores.append(prob)
+        entry: Dict = {
+            "id": row.get("id"),
+            "path": _clip_rel_path(row, manifest_dir),
+            "label": int(row.get("label", 0)),
+            "generator": str(row.get("generator", "")),
+            "cloakbreak": prob,
+        }
         if baseline is not None:
-            base_scores.append(baseline.predict_prob(degraded))
+            bprob = baseline.predict_prob(degraded)
+            base_scores.append(bprob)
+            entry["baseline"] = bprob
+        per_clip.append(entry)
+        if (i + 1) % 100 == 0:
+            print(f"[eval]   {i + 1}/{n_rows}", flush=True)
 
     arr = np.asarray(cb_scores, dtype=np.float64)
     out: Dict = {
@@ -434,6 +479,7 @@ def evaluate_clean_real_fpr(
         "cloakbreak_fpr_at_05_pct": round(float(np.mean(arr >= 0.5) * 100.0), 2) if arr.size else float("nan"),
         "cloakbreak_mean_prob": round(float(arr.mean()), 4) if arr.size else float("nan"),
         "cloakbreak_p95_prob": round(float(np.percentile(arr, 95)), 4) if arr.size else float("nan"),
+        "per_clip": per_clip,
     }
     if baseline is not None and base_scores:
         barr = np.asarray(base_scores, dtype=np.float64)
@@ -675,6 +721,50 @@ def format_markdown_table(results: Dict[str, Dict]) -> str:
     return "\n".join(lines)
 
 
+def build_test_slice_rows(test_rows: List[Dict], max_per_slice: int = 500) -> Dict[str, List[Dict]]:
+    """Rebuild the exact row lists run_evaluation scores, so other tools
+    (e.g. src.calibrate) can evaluate identical test slices."""
+    real_test = [r for r in test_rows if int(r["label"]) == 0]
+    clean_real_test = [r for r in real_test if r.get("generator") == "bonafide_clean"]
+    main_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" not in str(r.get("generator", ""))]
+    kokoro_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" in str(r.get("generator", ""))]
+
+    def balanced_pair(reals: List[Dict], spoofs: List[Dict]) -> List[Dict]:
+        n = min(len(reals), len(spoofs), max_per_slice // 2)
+        if n == 0:
+            return (reals + spoofs)[:max_per_slice]
+        return reals[:n] + spoofs[:n]
+
+    return {
+        "real_test": real_test,
+        "clean_real_test": clean_real_test[:max_per_slice],
+        "main_spoof": main_spoof,
+        "kokoro_spoof": kokoro_spoof,
+        "main_pair": balanced_pair(real_test, main_spoof),
+        "kokoro_all_pair": balanced_pair(real_test, kokoro_spoof) if kokoro_spoof else [],
+        "clean_vs_kokoro_pair": (
+            balanced_pair(clean_real_test, kokoro_spoof)
+            if (clean_real_test and kokoro_spoof)
+            else []
+        ),
+    }
+
+
+def _timed_eval_slice(
+    name: str,
+    condition: EvalCondition,
+    rows: List[Dict],
+    detector: DetectorRuntime,
+    baseline: BaselineDetectorRuntime | None,
+    manifest_dir: Path,
+) -> Dict:
+    print(f"[eval] slice={name} condition={condition} clips={len(rows)} start", flush=True)
+    t0 = time.perf_counter()
+    res = evaluate_slice(rows, detector, condition=condition, baseline=baseline, manifest_dir=manifest_dir)
+    print(f"[eval] slice={name} done in {time.perf_counter() - t0:.1f}s", flush=True)
+    return res
+
+
 def run_evaluation(
     manifest_path: Path,
     detector: DetectorRuntime,
@@ -688,35 +778,36 @@ def run_evaluation(
     if not test_rows:
         test_rows = rows
 
-    real_test = [r for r in test_rows if int(r["label"]) == 0]
-    clean_real_test = [r for r in real_test if r.get("generator") == "bonafide_clean"]
-    main_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" not in str(r.get("generator", ""))]
-    kokoro_spoof = [r for r in test_rows if int(r["label"]) == 1 and "kokoro" in str(r.get("generator", ""))]
-
-    def balanced_pair(reals: List[Dict], spoofs: List[Dict]) -> List[Dict]:
-        n = min(len(reals), len(spoofs), max_per_slice // 2)
-        if n == 0:
-            return (reals + spoofs)[:max_per_slice]
-        return reals[:n] + spoofs[:n]
-
-    main_pair = balanced_pair(real_test, main_spoof)
-    kokoro_all_pair = balanced_pair(real_test, kokoro_spoof) if kokoro_spoof else []
-    clean_vs_kokoro_pair = balanced_pair(clean_real_test, kokoro_spoof) if (clean_real_test and kokoro_spoof) else []
+    srows = build_test_slice_rows(test_rows, max_per_slice=max_per_slice)
+    real_test = srows["real_test"]
+    clean_real_test = srows["clean_real_test"]
+    main_spoof = srows["main_spoof"]
+    kokoro_spoof = srows["kokoro_spoof"]
+    main_pair = srows["main_pair"]
+    kokoro_all_pair = srows["kokoro_all_pair"]
+    clean_vs_kokoro_pair = srows["clean_vs_kokoro_pair"]
+    manifest_dir = manifest_path.parent
 
     slices: Dict[str, Dict] = {
         "shortcut_audit": run_shortcut_audit(manifest_path, max_per_split=max_per_slice),
     }
     for cond in ("clean", "opus_16k", "phone_8k", "noise_10db", "noise_5db", "short_0.5s", "short_0.8s"):
-        slices[f"test_{cond}"] = evaluate_slice(main_pair, detector, condition=cond, baseline=baseline)
-    if kokoro_all_pair:
-        slices["unseen_kokoro_clean"] = evaluate_slice(kokoro_all_pair, detector, condition="clean", baseline=baseline)
-        slices["unseen_kokoro_opus_16k"] = evaluate_slice(kokoro_all_pair, detector, condition="opus_16k", baseline=baseline)
-    if clean_vs_kokoro_pair:
-        slices["clean_real_vs_kokoro_clean"] = evaluate_slice(
-            clean_vs_kokoro_pair, detector, condition="clean", baseline=baseline
+        slices[f"test_{cond}"] = _timed_eval_slice(
+            f"test_{cond}", cond, main_pair, detector, baseline, manifest_dir
         )
-        slices["clean_real_vs_kokoro_opus_16k"] = evaluate_slice(
-            clean_vs_kokoro_pair, detector, condition="opus_16k", baseline=baseline
+    if kokoro_all_pair:
+        slices["unseen_kokoro_clean"] = _timed_eval_slice(
+            "unseen_kokoro_clean", "clean", kokoro_all_pair, detector, baseline, manifest_dir
+        )
+        slices["unseen_kokoro_opus_16k"] = _timed_eval_slice(
+            "unseen_kokoro_opus_16k", "opus_16k", kokoro_all_pair, detector, baseline, manifest_dir
+        )
+    if clean_vs_kokoro_pair:
+        slices["clean_real_vs_kokoro_clean"] = _timed_eval_slice(
+            "clean_real_vs_kokoro_clean", "clean", clean_vs_kokoro_pair, detector, baseline, manifest_dir
+        )
+        slices["clean_real_vs_kokoro_opus_16k"] = _timed_eval_slice(
+            "clean_real_vs_kokoro_opus_16k", "opus_16k", clean_vs_kokoro_pair, detector, baseline, manifest_dir
         )
 
     if real_test and main_spoof:
@@ -724,7 +815,9 @@ def run_evaluation(
             real_test, main_spoof, max_total=max_per_slice, seed=42
         )
         if matched:
-            res = evaluate_slice(matched, detector, condition="clean", baseline=baseline)
+            res = _timed_eval_slice(
+                "rolloff_matched_clean", "clean", matched, detector, baseline, manifest_dir
+            )
             res["rolloff_matching"] = rolloff_summary
             slices["rolloff_matched_clean"] = res
     if real_test and kokoro_spoof:
@@ -732,14 +825,22 @@ def run_evaluation(
             real_test, kokoro_spoof, max_total=max_per_slice, seed=42
         )
         if matched_k:
-            res_k = evaluate_slice(matched_k, detector, condition="clean", baseline=baseline)
+            res_k = _timed_eval_slice(
+                "rolloff_matched_unseen_kokoro_clean", "clean", matched_k, detector, baseline, manifest_dir
+            )
             res_k["rolloff_matching"] = rolloff_summary_k
             slices["rolloff_matched_unseen_kokoro_clean"] = res_k
 
     if clean_real_test:
-        slices["clean_real_fpr"] = evaluate_clean_real_fpr(
-            clean_real_test[:max_per_slice], detector, baseline=baseline, condition="clean"
+        print(
+            f"[eval] slice=clean_real_fpr condition=clean clips={len(clean_real_test)} start",
+            flush=True,
         )
+        t0 = time.perf_counter()
+        slices["clean_real_fpr"] = evaluate_clean_real_fpr(
+            clean_real_test, detector, baseline=baseline, condition="clean", manifest_dir=manifest_dir
+        )
+        print(f"[eval] slice=clean_real_fpr done in {time.perf_counter() - t0:.1f}s", flush=True)
 
     if results_dir is not None:
         save_audit_json(slices["shortcut_audit"], Path(results_dir), "eval_shortcut_audit", manifest_path)
@@ -766,7 +867,7 @@ def main() -> None:
     parser.add_argument("--fp32-model", type=Path, default=None, help="FP32 ONNX path for --int8-parity")
     parser.add_argument("--max-auroc-diff", type=float, default=0.01, help="INT8 parity AUROC tolerance")
     parser.add_argument("--parity-max-clips", type=int, default=None, help="Cap val clips for --int8-parity")
-    parser.add_argument("--onnx-threads", type=int, default=min(os.cpu_count() or 2, 8),
+    parser.add_argument("--onnx-threads", type=int, default=min(effective_cpu_count(), 8),
                         help="ONNX intra-op threads for --int8-parity")
     parser.add_argument("--shortcut-only", action="store_true", help="Run only acoustic shortcut audit & disjoint check")
     parser.add_argument(

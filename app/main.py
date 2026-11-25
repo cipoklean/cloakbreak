@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import hmac
 import json
 import os
@@ -42,6 +43,27 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return val.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except ValueError:
+        return default
+
+
+def _sha256_file(path: Path) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
 class AppState:
     def __init__(self) -> None:
         self.backend_mode = os.getenv("CLOAKBREAK_BACKEND", "mock").strip().lower()
@@ -50,10 +72,42 @@ class AppState:
         self.device = os.getenv("CLOAKBREAK_DEVICE", "cpu").strip()
         self.clone_enabled = _env_flag("ENABLE_CLONE_ENDPOINT", default=False)
         self.clone_token = os.getenv("CLOAKBREAK_CLONE_TOKEN", "").strip()
+        # Sub-2s windows are at chance; never run the detector on them.
+        self.min_window_sec = max(2.0, _env_float("CLOAKBREAK_MIN_WINDOW_SEC", 2.0))
+        self.threshold, self.threshold_source = self._resolve_threshold()
 
         self.detector: DetectorRuntime = self._init_detector()
         self.baseline: Optional[BaselineDetectorRuntime] = self._init_baseline()
         self._chatterbox_model = None
+
+    def _resolve_threshold(self) -> tuple[float, str]:
+        env_raw = os.getenv("CLOAKBREAK_THRESHOLD", "").strip()
+        if env_raw:
+            try:
+                return float(env_raw), "env"
+            except ValueError:
+                print(f"[app] CLOAKBREAK_THRESHOLD={env_raw!r} is not a float — ignoring", flush=True)
+        tfile_raw = os.getenv("CLOAKBREAK_THRESHOLD_FILE", "").strip()
+        tfile = Path(tfile_raw) if tfile_raw else ROOT_DIR / "results" / "threshold_calibration.json"
+        if tfile.exists():
+            try:
+                data = json.loads(tfile.read_text(encoding="utf-8"))
+                t = float(data.get("operating_threshold"))
+            except Exception as exc:
+                print(f"[app] could not read threshold file {tfile}: {exc}", flush=True)
+            else:
+                file_sha = data.get("model_sha256")
+                if self.model_path and file_sha:
+                    actual = _sha256_file(Path(self.model_path))
+                    if actual is not None and file_sha != actual:
+                        print(
+                            f"[app] threshold file {tfile} model_sha256 does not match "
+                            f"CLOAKBREAK_MODEL_PATH — falling back to 0.5",
+                            flush=True,
+                        )
+                        return 0.5, "default_0.5_model_mismatch"
+                return t, "file"
+        return 0.5, "default_0.5"
 
     def _init_detector(self) -> DetectorRuntime:
         if self.backend_mode == "onnx" and self.model_path:
@@ -94,6 +148,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "baseline_loaded": ctx.baseline is not None,
             "baseline_id": ctx.baseline.model_id if ctx.baseline else None,
             "clone_enabled": ctx.clone_enabled,
+            "threshold": ctx.threshold,
+            "threshold_source": ctx.threshold_source,
         })
 
     @app.post("/api/detect-file")
@@ -110,6 +166,14 @@ def create_app(state: AppState | None = None) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=f"Invalid WAV audio: {exc}") from exc
 
+        if wav.shape[0] / float(TARGET_SR) < ctx.min_window_sec:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"need at least {ctx.min_window_sec:.1f} s of audio "
+                    "(clips under 1 s are at chance)"
+                ),
+            )
         if wav.shape[0] > TARGET_SR * 20:
             wav = wav[: TARGET_SR * 20]
         degraded = degrade_for_eval(wav, condition=condition, sr=sr)
@@ -124,6 +188,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "condition": condition,
             "duration_s": round(degraded.shape[0] / float(TARGET_SR), 2),
             "is_speech": rms_vad(degraded),
+            "threshold": ctx.threshold,
+            "verdict": "spoof" if res.spoof_prob >= ctx.threshold else "bonafide",
         })
 
     @app.post("/api/clone")
@@ -214,6 +280,22 @@ def create_app(state: AppState | None = None) -> FastAPI:
                     continue
 
                 window = ring.get_window()
+                if ring.filled_sec < ctx.min_window_sec:
+                    await websocket.send_json({
+                        "type": "prediction",
+                        "warming_up": True,
+                        "is_speech": rms_vad(window),
+                        "spoof_prob": None,
+                        "baseline_prob": None,
+                        "attention_focus": [0.0] * 32,
+                        "latency_ms": 0.0,
+                        "backend": ctx.detector.backend_name,
+                        "condition": condition,
+                        "window_sec": round(ring.filled_sec, 2),
+                        "threshold": ctx.threshold,
+                        "verdict": None,
+                    })
+                    continue
                 speech = rms_vad(window)
                 if not speech:
                     await websocket.send_json({
@@ -226,6 +308,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
                         "backend": ctx.detector.backend_name,
                         "condition": condition,
                         "window_sec": round(ring.filled_sec, 2),
+                        "threshold": ctx.threshold,
+                        "verdict": None,
                     })
                     continue
 
@@ -242,6 +326,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
                     "backend": res.backend,
                     "condition": condition,
                     "window_sec": round(ring.filled_sec, 2),
+                    "threshold": ctx.threshold,
+                    "verdict": "spoof" if res.spoof_prob >= ctx.threshold else "bonafide",
                 })
         except WebSocketDisconnect:
             return

@@ -86,6 +86,13 @@ def download_checkpoint(
         return None
 
 
+def _onnx_repo_files(args: argparse.Namespace) -> List[str]:
+    names = list(MODEL_REPO_FILES)
+    if getattr(args, "exclude_int8", False):
+        names = [n for n in names if n != "cloakbreak_int8.onnx"]
+    return names
+
+
 def _plan_upload_artifacts(args: argparse.Namespace) -> List[str]:
     """Return human-readable ``local -> repo:path`` plan lines."""
     prefix = args.prefix.strip("/")
@@ -93,7 +100,7 @@ def _plan_upload_artifacts(args: argparse.Namespace) -> List[str]:
     lines: List[str] = []
 
     ckpt_dir = Path(args.ckpt_dir)
-    for name in MODEL_REPO_FILES:
+    for name in _onnx_repo_files(args):
         p = ckpt_dir / name
         if p.exists():
             lines.append(f"{p} -> {prefix}onnx/{p.name}")
@@ -130,7 +137,7 @@ def _run_upload_artifacts(args: argparse.Namespace) -> int:
     ensure_model_repo(args.repo)
     ckpt_dir = Path(args.ckpt_dir)
 
-    onnx_files = [ckpt_dir / n for n in MODEL_REPO_FILES if (ckpt_dir / n).exists()]
+    onnx_files = [ckpt_dir / n for n in _onnx_repo_files(args) if (ckpt_dir / n).exists()]
     if onnx_files:
         upload_files(args.repo, onnx_files, f"{prefix}onnx/", commit_message="CloakBreak ONNX exports")
 
@@ -171,6 +178,8 @@ def main() -> None:
     up.add_argument("--log-dir", type=Path, required=True)
     up.add_argument("--prefix", type=str, default="", help="Repo path prefix, e.g. 'smoke_check/' or ''")
     up.add_argument("--dry-run", action="store_true", help="Print the upload plan without uploading")
+    up.add_argument("--exclude-int8", action="store_true",
+                    help="Skip cloakbreak_int8.onnx (INT8 parity failed — fp32 is the deployable artifact)")
 
     args = parser.parse_args()
     if args.command == "upload-artifacts":

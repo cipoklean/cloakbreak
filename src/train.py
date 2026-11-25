@@ -24,6 +24,7 @@ from src.model import (
     export_to_onnx,
     quantize_onnx_int8,
 )
+from src.sysinfo import effective_cpu_count
 
 SEED_BASE = 42
 
@@ -223,15 +224,10 @@ def train_model(
     if overlap and len(rows) > 10:
         print(f"[warn] {len(overlap)} overlapping speakers between train/val", flush=True)
 
-    n_pos = sum(1 for r in train_rows if int(r["label"]) == 1)
-    n_neg = max(1, len(train_rows) - n_pos)
-    pos_weight = torch.tensor([n_neg / max(1, n_pos)], dtype=torch.float32, device=device)
-
-    if num_workers is None:
-        workers = min(os.cpu_count() or 2, 8) if device.type == "cuda" else 0
-    else:
-        workers = max(0, num_workers)
-
+    # Opus cache precompute runs BEFORE any CUDA tensor/device use: the pool
+    # uses the spawn start method, and keeping it ahead of torch's first CUDA
+    # touch avoids fork-after-CUDA hazards and oversubscription on
+    # quota-limited boxes.
     opus_cache_map: Dict[str, str] = {}
     if precompute_opus and has_ffmpeg():
         cache_dir = opus_cache_dir or (manifest_path.parent / "opus_cache_16k")
@@ -240,7 +236,8 @@ def train_model(
             [r["path"] for r in train_rows],
             cache_dir=cache_dir,
             bitrate_kbps=16,
-            num_workers=max(1, min(os.cpu_count() or 2, 12)),
+            num_workers=max(1, min(effective_cpu_count(), 12)),
+            progress_every=500,
         )
         elapsed_c = max(time.perf_counter() - t_cache, 1e-6)
         print(
@@ -248,6 +245,15 @@ def train_model(
             f"({len(opus_cache_map) / elapsed_c:.1f} clips/sec).",
             flush=True,
         )
+
+    n_pos = sum(1 for r in train_rows if int(r["label"]) == 1)
+    n_neg = max(1, len(train_rows) - n_pos)
+    pos_weight = torch.tensor([n_neg / max(1, n_pos)], dtype=torch.float32, device=device)
+
+    if num_workers is None:
+        workers = min(effective_cpu_count(), 8) if device.type == "cuda" else 0
+    else:
+        workers = max(0, num_workers)
 
     augmenter = TrainCodecAugmenter(allow_inline_opus=False, seed=42)
     train_ds = SpoofAudioDataset(train_rows, augmenter=augmenter, opus_cache_map=opus_cache_map, random_crop=True)

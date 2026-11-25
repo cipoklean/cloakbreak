@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
 import os
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ import numpy as np
 from scipy.signal import butter, filtfilt
 
 from src.audio_utils import TARGET_SR, load_wav_mono, normalize_loudness, resample_audio, save_wav_mono
+from src.sysinfo import effective_cpu_count
 
 EvalCondition = Literal["clean", "opus_16k", "phone_8k", "noise_10db", "noise_5db", "short_0.5s", "short_0.8s"]
 
@@ -104,7 +106,7 @@ def precompute_opus_cache(
     cache_dir: str | Path,
     bitrate_kbps: int = 16,
     num_workers: int | None = None,
-    progress_every: int = 1000,
+    progress_every: int = 500,
 ) -> Dict[str, str]:
     """Pre-compute Opus-degraded WAV variants once in parallel across vCPUs.
 
@@ -125,7 +127,7 @@ def precompute_opus_cache(
     reused = sum(
         1 for _, dst_s, _ in tasks if (Path(dst_s).exists() and Path(dst_s).stat().st_size > 100)
     )
-    workers = num_workers if num_workers is not None else min(os.cpu_count() or 2, 12)
+    workers = num_workers if num_workers is not None else min(effective_cpu_count(), 12)
     mapping: Dict[str, str] = {}
     done = 0
     t0 = time.perf_counter()
@@ -146,7 +148,10 @@ def precompute_opus_cache(
             if done % step == 0:
                 _report()
     else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
+        # "spawn" avoids the fork-after-CUDA deadlock seen when the pool is
+        # created after torch has touched the GPU (pos_weight on CUDA, etc.).
+        ctx = multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
             for src_s, dst_s in ex.map(_precompute_one_opus, tasks, chunksize=8):
                 mapping[src_s] = dst_s
                 done += 1

@@ -124,6 +124,7 @@
         <div class="bar-track"><div class="bar-fill" id="cbBar"></div></div>
         <div class="meta-row">
           <span>Verdict: <strong id="cbVerdict">Waiting</strong></span>
+          <span>Threshold: <strong id="thresholdVal">--</strong></span>
           <span>Latency: <strong id="latencyVal">-- ms</strong></span>
         </div>
       </div>
@@ -181,6 +182,7 @@
       cloneRefWav: document.getElementById("cloneRefWav"),
       cloneBtn: document.getElementById("cloneBtn"),
       cloneAudio: document.getElementById("cloneAudio"),
+      thresholdVal: document.getElementById("thresholdVal"),
     };
 
     const ctx2d = els.canvas.getContext("2d");
@@ -214,7 +216,15 @@
     function renderResult(data) {
       els.vadStatus.textContent = data.is_speech ? "Speech" : "Silence";
       els.latencyVal.textContent = `${data.latency_ms ?? 0} ms`;
-      if (data.spoof_prob == null) {
+      if (data.threshold != null) {
+        els.thresholdVal.textContent = `threshold ${Number(data.threshold).toFixed(2)}`;
+      }
+      if (data.warming_up) {
+        els.cbScore.textContent = "--";
+        els.cbBar.style.width = "0%";
+        const have = data.window_sec != null ? data.window_sec.toFixed(1) : "?";
+        els.cbVerdict.textContent = `Warming up (${have}s / 2.0s)`;
+      } else if (data.spoof_prob == null) {
         els.cbScore.textContent = "--";
         els.cbVerdict.textContent = "Listening (silence)";
         els.cbBar.style.width = "0%";
@@ -223,7 +233,7 @@
         els.cbScore.textContent = `${pct}%`;
         els.cbBar.style.width = `${pct}%`;
         els.cbBar.style.background = colorForProb(data.spoof_prob);
-        els.cbVerdict.textContent = data.spoof_prob >= 0.5 ? "SPOOF" : "BONAFIDE";
+        els.cbVerdict.textContent = data.verdict === "spoof" ? "SPOOF" : "BONAFIDE";
       }
       if (data.baseline_prob != null) {
         const bpct = Math.round(data.baseline_prob * 100);
@@ -239,6 +249,9 @@
       const data = await res.json();
       els.backendBadge.textContent = `backend: ${data.backend}`;
       els.baseModel.textContent = data.baseline_loaded ? data.baseline_id : "Not loaded";
+      if (data.threshold != null) {
+        els.thresholdVal.textContent = `threshold ${Number(data.threshold).toFixed(2)}`;
+      }
       if (data.clone_enabled) {
         els.clonePanel.classList.remove("hidden");
       }

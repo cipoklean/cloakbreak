@@ -5,6 +5,31 @@ pandas==3.0.6
 datasets==5.2.0
 setuptools==80.9.0
 huggingface-hub==1.33.0
+# transformers 5.2.0 stack — transitive deps pinned to requirements-gpu.lock versions
+transformers==5.2.0
+tokenizers==0.22.2
+safetensors==0.5.3
+regex==2026.11.23
+typer-slim==0.24.0
+typer==0.29.2
+rich==15.0.0
+shellingham==1.5.4
+markdown-it-py==4.3.0
+mdurl==0.1.2
+annotated-doc==0.0.7
+filelock==4.3.1
+# remaining transformers/huggingface-hub/httpx transitive deps (gpu-lock versions)
+pyyaml==6.0.4
+packaging==26.4
+tqdm==4.70.1
+typing-extensions==4.16.0
+hf-xet==1.8.0
+click==8.5.1
+httpcore==1.0.9
+h11==0.16.0
+certifi==2026.11.20
+idna==3.20
+anyio==4.16.0
 scipy==1.17.1
 soundfile==0.14.0
 onnx==1.23.2
