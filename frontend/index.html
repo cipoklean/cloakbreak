@@ -181,6 +181,14 @@
     canvas.spark { height: 96px; }
     canvas.attn { height: 170px; }
     .caption { font-size: 12px; color: var(--muted); }
+    .mic-footer {
+      margin-top: 16px;
+      min-height: 1.2em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-variant-numeric: tabular-nums;
+      font-size: 12px;
+      color: var(--muted);
+    }
     .hidden { display: none; }
     audio { width: 100%; margin-top: 4px; }
 
@@ -269,9 +277,89 @@
       </div>
       <audio id="cloneAudio" controls></audio>
     </div>
+
+    <div class="mic-footer" id="micFooter"></div>
   </div>
 
   <script>
+    // BEGIN StreamResampler16k
+    // Streaming 16 kHz resampler: windowed-sinc anti-alias FIR at the input
+    // rate (cutoff 7200 Hz, Blackman window), then linear-interpolation read
+    // at inRate/16000. Stateful across chunks: FIR history ring + fractional
+    // read position, so chunk boundaries add no clicks. Plain ES2015 — also
+    // runs unchanged in Node (tests/test_resampler_js.py extracts this block).
+    class StreamResampler16k {
+      constructor(inRate) {
+        this.inRate = inRate | 0;
+        this.outRate = 16000;
+        this.passthrough = this.inRate === this.outRate;
+        this.step = this.passthrough ? 1 : this.inRate / this.outRate;
+        this.ntaps = 0;
+        this.h = null;
+        this.ring = null;
+        this.ringPos = 0;
+        this.absIn = 0;
+        this.fy = [];
+        this.readPos = 0;
+        if (this.passthrough) return;
+
+        const fc = Math.min(7200, 0.45 * this.inRate);
+        let n = Math.round((129 * this.inRate) / 48000);
+        if (n % 2 === 0) n += 1;
+        if (n < 33) n = 33;
+        this.ntaps = n;
+        const h = new Float64Array(n);
+        const fcNorm = fc / this.inRate;
+        const mid = (n - 1) / 2;
+        let sum = 0;
+        for (let i = 0; i < n; i++) {
+          const x = i - mid;
+          const t = 2 * fcNorm * x;
+          const sinc = t === 0 ? 1 : Math.sin(Math.PI * t) / (Math.PI * t);
+          const u = i / (n - 1);
+          const win = 0.42 - 0.5 * Math.cos(2 * Math.PI * u) + 0.08 * Math.cos(4 * Math.PI * u);
+          const v = 2 * fcNorm * sinc * win;
+          h[i] = v;
+          sum += v;
+        }
+        for (let i = 0; i < n; i++) h[i] /= sum;
+        this.h = h;
+        this.ring = new Float64Array(n);
+      }
+
+      process(chunk) {
+        if (this.passthrough) return chunk;
+        const out = [];
+        const n = this.ntaps, h = this.h, ring = this.ring;
+        const fy = this.fy;
+        for (let s = 0; s < chunk.length; s++) {
+          ring[this.ringPos] = chunk[s];
+          let acc = 0, idx = this.ringPos;
+          for (let k = 0; k < n; k++) {
+            acc += h[k] * ring[idx];
+            idx = idx === 0 ? n - 1 : idx - 1;
+          }
+          this.ringPos = this.ringPos === n - 1 ? 0 : this.ringPos + 1;
+          this.absIn++;
+          fy.push(acc);
+          if (fy.length > 64) fy.splice(0, fy.length - 64);
+          const lastIdx = this.absIn - 1;
+          while (this.readPos + 1 <= lastIdx) {
+            const i0 = Math.floor(this.readPos);
+            const frac = this.readPos - i0;
+            const base = this.absIn - fy.length;
+            const j0 = i0 - base, j1 = j0 + 1;
+            const y0 = j0 >= 0 ? fy[j0] : 0;
+            const y1 = j1 >= 0 && j1 < fy.length ? fy[j1] : 0;
+            out.push(y0 + (y1 - y0) * frac);
+            this.readPos += this.step;
+          }
+        }
+        return Float32Array.from(out);
+      }
+    }
+    // END StreamResampler16k
+
     const els = {
       backendBadge: document.getElementById("backendBadge"),
       micBtn: document.getElementById("micBtn"),
@@ -303,6 +391,7 @@
       cloneRefWav: document.getElementById("cloneRefWav"),
       cloneBtn: document.getElementById("cloneBtn"),
       cloneAudio: document.getElementById("cloneAudio"),
+      micFooter: document.getElementById("micFooter"),
     };
 
     const COL = {
@@ -326,6 +415,26 @@
     let scoreHistory = [];
     let lastFocus = null;
     let lastProb = null;
+    let micFooterState = null;
+    let debugCaptureOn = false;
+
+    function renderMicFooter() {
+      if (!micFooterState) {
+        els.micFooter.textContent = debugCaptureOn
+          ? "Debug capture ON — saving received audio to results/live_capture/"
+          : "";
+        return;
+      }
+      const st = micFooterState.settings || {};
+      const g = (k) => (st[k] === undefined || st[k] === null ? "n/a" : String(st[k]));
+      const rate = st.sampleRate;
+      els.micFooter.textContent =
+        `Mic: echoCancellation=${g("echoCancellation")} · noiseSuppression=${g("noiseSuppression")}` +
+        ` · autoGainControl=${g("autoGainControl")}` +
+        ` · device rate ${rate === undefined || rate === null ? "n/a" : rate + " Hz"}` +
+        ` · context ${micFooterState.ctxRate} Hz · resampler: ${micFooterState.resamplerMode}` +
+        (debugCaptureOn ? " · Debug capture ON — saving received audio to results/live_capture/" : "");
+    }
 
     function colorFor(p, t) {
       const tt = t == null ? 0.5 : Number(t);
@@ -549,20 +658,11 @@
         updateBaselineCard();
         if (data.threshold != null) setThreshold(data.threshold);
         if (data.clone_enabled) els.clonePanel.classList.remove("hidden");
+        debugCaptureOn = data.debug_capture === true;
+        renderMicFooter();
       } catch (err) {
         els.backendBadge.textContent = "backend: unreachable";
       }
-    }
-
-    function downsampleTo16k(float32, inRate) {
-      if (inRate === 16000) return float32;
-      const ratio = inRate / 16000;
-      const outLen = Math.floor(float32.length / ratio);
-      const out = new Float32Array(outLen);
-      for (let i = 0; i < outLen; i++) {
-        out[i] = float32[Math.floor(i * ratio)];
-      }
-      return out;
     }
 
     function floatToPcm16(float32) {
@@ -582,6 +682,8 @@
       if (ws) { ws.close(); ws = null; }
       els.micBtn.textContent = "Start Live Mic";
       els.micBtn.className = "primary";
+      micFooterState = null;
+      renderMicFooter();
       setBanner("listen", "Microphone stopped");
     }
 
@@ -598,15 +700,45 @@
       };
       ws.onopen = async () => {
         ws.send(JSON.stringify({ condition: els.conditionSel.value }));
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioCtx = new AudioContext();
-        const src = audioCtx.createMediaStreamSource(mediaStream);
-        processor = audioCtx.createScriptProcessor(4096, 1, 1);
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1,
+          },
+        });
+        const track = mediaStream.getAudioTracks()[0];
+        const settings = track && track.getSettings ? track.getSettings() : {};
+        console.log("[mic] getUserMedia settings:", settings);
+
+        let src = null;
+        let resampler = null;
+        let resamplerMode = "";
+        try {
+          // Preferred path: let the browser resample to 16 kHz (band-limited).
+          audioCtx = new AudioContext({ sampleRate: 16000 });
+          src = audioCtx.createMediaStreamSource(mediaStream);
+          resamplerMode = "browser";
+        } catch (err) {
+          // e.g. Firefox NotSupportedError when the stream rate differs.
+          console.warn("[mic] 16 kHz AudioContext path failed, using FIR fallback:", err);
+          if (audioCtx) { try { await audioCtx.close(); } catch (_) { /* ignore */ } audioCtx = null; }
+          audioCtx = new AudioContext();
+          resampler = new StreamResampler16k(audioCtx.sampleRate);
+          src = audioCtx.createMediaStreamSource(mediaStream);
+          resamplerMode = resampler.passthrough ? "native" : `FIR fallback from ${audioCtx.sampleRate} Hz`;
+        }
+        micFooterState = { settings, ctxRate: audioCtx.sampleRate, resamplerMode };
+        renderMicFooter();
+
+        const procFrames = resampler && !resampler.passthrough ? 4096 : 1024;
+        processor = audioCtx.createScriptProcessor(procFrames, 1, 1);
         processor.onaudioprocess = (ev) => {
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
           const mono = ev.inputBuffer.getChannelData(0);
-          const ds = downsampleTo16k(mono, audioCtx.sampleRate);
-          ws.send(floatToPcm16(ds));
+          const out = resampler ? resampler.process(mono) : mono;
+          ws.send(floatToPcm16(out));
         };
         src.connect(processor);
         processor.connect(audioCtx.destination);

@@ -1,0 +1,54 @@
+{
+  "manifest": "data/cloakbreak_v1/manifest.jsonl",
+  "model_path": "artifacts/session2/onnx/cloakbreak_fp32.onnx",
+  "generator": "bonafide_clean",
+  "split": "test",
+  "minutes": 2.0,
+  "hf_noise_dbfs": -35.0,
+  "seed": 42,
+  "port": 40107,
+  "tmpdir": "/tmp/cb_live_mic_vv1owms2",
+  "health": {
+    "status": "ok",
+    "backend": "onnx:cloakbreak_fp32.onnx",
+    "baseline_loaded": false,
+    "baseline_id": null,
+    "clone_enabled": false,
+    "threshold": 0.95255,
+    "threshold_source": "file",
+    "debug_capture": true
+  },
+  "footer": "Mic: echoCancellation=false \u00b7 noiseSuppression=false \u00b7 autoGainControl=false \u00b7 device rate 44100 Hz \u00b7 context 16000 Hz \u00b7 resampler: browser \u00b7 Debug capture ON \u2014 saving received audio to results/live_capture/",
+  "resampler_mode": "browser",
+  "n_render_result_payloads": 104,
+  "n_speech_verdicts": 96,
+  "score_p50": 0.005350000000000001,
+  "score_p95": 0.86225,
+  "score_max": 0.9919,
+  "threshold": 0.95255,
+  "frac_windows_ge_threshold": 0.041666666666666664,
+  "frac_likely_clone": 0.041666666666666664,
+  "offline_vs_live": {
+    "n_windows": 96,
+    "max_abs_diff": 0.0213,
+    "mean_abs_diff": 0.00022187499999999999,
+    "frac_offline_ge_threshold": 0.041666666666666664
+  },
+  "reference_source": {
+    "offset_samples": 346,
+    "offset_sec": 0.0216,
+    "align_peak": 0.0959,
+    "n_scored": 96,
+    "frac_source_ge_threshold": 0.03125,
+    "mean_abs_diff_capture_vs_source": 0.032377083333333334,
+    "max_abs_diff_capture_vs_source": 0.47569999999999996
+  },
+  "capture_wav": "/tmp/cb_live_mic_vv1owms2/captures/20261126T120316Z_c64dea9b.wav",
+  "capture_json": "/tmp/cb_live_mic_vv1owms2/captures/20261126T120316Z_c64dea9b.json",
+  "replay_json": "/tmp/cb_live_mic_vv1owms2/replay.json",
+  "server_log": "/tmp/cb_live_mic_vv1owms2/uvicorn.log",
+  "console_tail": [
+    "[mic] getUserMedia settings: {autoGainControl: false, channelCount: 2, deviceId: default, echoCancellation: false, groupId: 8b8fc22e3fa141c5004343e16cc241041813334039343655638106d9d900adc6}",
+    "The ScriptProcessorNode is deprecated. Use AudioWorkletNode instead. (https://bit.ly/audio-worklet)"
+  ]
+}

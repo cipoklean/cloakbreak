@@ -7,6 +7,8 @@ import hmac
 import json
 import os
 import tempfile
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -36,6 +38,8 @@ from src.model import (
 ROOT_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_HTML = ROOT_DIR / "frontend" / "index.html"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB (~15s stereo WAV max)
+CAPTURE_MAX_SECONDS = 30 * 60
+CAPTURE_MAX_SAMPLES = CAPTURE_MAX_SECONDS * TARGET_SR
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -77,6 +81,13 @@ class AppState:
         # Sub-2s windows are at chance; never run the detector on them.
         self.min_window_sec = max(2.0, _env_float("CLOAKBREAK_MIN_WINDOW_SEC", 2.0))
         self.threshold, self.threshold_source = self._resolve_threshold()
+        # Opt-in debug capture of raw WS audio (contains the user's voice —
+        # results/live_capture/ is gitignored and must never be committed).
+        self.debug_capture = _env_flag("CLOAKBREAK_DEBUG_CAPTURE", default=False)
+        self.capture_dir = Path(
+            os.getenv("CLOAKBREAK_CAPTURE_DIR", "").strip()
+            or (ROOT_DIR / "results" / "live_capture")
+        )
 
         self.detector: DetectorRuntime = self._init_detector()
         self.baseline: Optional[BaselineDetectorRuntime] = self._init_baseline()
@@ -131,6 +142,28 @@ class AppState:
         return self._chatterbox_model
 
 
+def _write_live_capture(capture_dir: Path, cap: dict) -> Path:
+    """Persist one captured WS session: 16 kHz mono PCM_16 WAV + JSON sidecar."""
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stem = f"{stamp}_{cap['id']}"
+    wav_path = capture_dir / f"{stem}.wav"
+    chunks = cap["chunks"]
+    audio = np.concatenate(chunks) if len(chunks) > 1 else chunks[0]
+    save_wav_mono(wav_path, audio, TARGET_SR)
+    meta = {
+        "file": wav_path.name,
+        "sample_rate": TARGET_SR,
+        "channels": 1,
+        "duration_s": round(cap["total"] / float(TARGET_SR), 3),
+        "truncated": bool(cap["truncated"]),
+        "n_chunks": len(chunks),
+        "windows": cap["verdicts"],
+    }
+    (capture_dir / f"{stem}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return wav_path
+
+
 def create_app(state: AppState | None = None) -> FastAPI:
     app = FastAPI(title="CloakBreak", version="0.1.0")
     app.state.ctx = state or AppState()
@@ -152,6 +185,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "clone_enabled": ctx.clone_enabled,
             "threshold": ctx.threshold,
             "threshold_source": ctx.threshold_source,
+            "debug_capture": ctx.debug_capture,
         })
 
     @app.post("/api/detect-file")
@@ -276,11 +310,33 @@ def create_app(state: AppState | None = None) -> FastAPI:
             min_window_sec=ctx.min_window_sec,
         )
 
+        cap = None
+        if ctx.debug_capture:
+            cap = {
+                "id": uuid.uuid4().hex[:8],
+                "chunks": [],
+                "total": 0,
+                "truncated": False,
+                "verdicts": [],
+            }
+
         async def emit(msg: dict) -> None:
             msg = dict(msg)
             msg["condition"] = cond_box["condition"]
             if msg.get("backend") is None:
                 msg["backend"] = ctx.detector.backend_name
+            if cap is not None and msg.get("type") == "prediction" and msg.get("is_speech") is True:
+                if msg.get("spoof_prob") is not None:
+                    cap["verdicts"].append({
+                        "audio_start_sec": msg.get("audio_start_sec"),
+                        "audio_end_sec": msg.get("audio_end_sec"),
+                        "spoof_prob": msg.get("spoof_prob"),
+                        "baseline_prob": msg.get("baseline_prob"),
+                        "verdict": msg.get("verdict"),
+                        "window_verdict": msg.get("window_verdict"),
+                        "condition": msg.get("condition"),
+                        "threshold": msg.get("threshold"),
+                    })
             await websocket.send_json(msg)
 
         scorer_task = asyncio.create_task(scorer.run(emit))
@@ -309,24 +365,44 @@ def create_app(state: AppState | None = None) -> FastAPI:
                 if not pcm_bytes:
                     continue
 
-                scorer.push(pcm16_bytes_to_float32(pcm_bytes))
+                pcm = pcm16_bytes_to_float32(pcm_bytes)
+                if cap is not None:
+                    # Capture exactly what the scorer sees — same decoded array,
+                    # no resampling or normalization. Cap at 30 min of audio.
+                    if cap["total"] >= CAPTURE_MAX_SAMPLES:
+                        cap["truncated"] = True
+                    else:
+                        cap["chunks"].append(pcm)
+                        cap["total"] += int(pcm.size)
+                scorer.push(pcm)
         except WebSocketDisconnect:
             pass
         finally:
-            scorer.stop()
             try:
-                await asyncio.wait_for(asyncio.shield(scorer_task), timeout=5.0)
-            except asyncio.TimeoutError:
-                scorer_task.cancel()
+                scorer.stop()
                 try:
-                    await scorer_task
+                    await asyncio.wait_for(asyncio.shield(scorer_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    scorer_task.cancel()
+                    try:
+                        await scorer_task
+                    except asyncio.CancelledError:
+                        pass
                 except asyncio.CancelledError:
-                    pass
-            except asyncio.CancelledError:
-                scorer_task.cancel()
-                raise
-            except Exception as exc:
-                print(f"[ws] live scorer task ended with error: {exc}", flush=True)
+                    scorer_task.cancel()
+                    raise
+                except Exception as exc:
+                    print(f"[ws] live scorer task ended with error: {exc}", flush=True)
+            finally:
+                # Runs even if the handler task is cancelled (e.g. TestClient
+                # teardown): the capture must not be lost with the session.
+                # Written synchronously — an await here could be cancelled
+                # before the thread picks up the work.
+                if cap is not None and cap["chunks"]:
+                    try:
+                        _write_live_capture(ctx.capture_dir, cap)
+                    except Exception as exc:
+                        print(f"[ws] debug capture write failed: {exc}", flush=True)
 
     return app
 

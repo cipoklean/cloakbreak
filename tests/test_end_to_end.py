@@ -455,6 +455,22 @@ def test_frontend_demo_page_static() -> None:
     assert "not proof" in low
 
 
+def test_frontend_mic_audio_path_static() -> None:
+    """Static contract for the anti-aliased live-mic audio path."""
+    html = (Path(__file__).resolve().parents[1] / "frontend" / "index.html").read_text(encoding="utf-8")
+    for needle in (
+        "sampleRate: 16000",
+        "echoCancellation: false",
+        "noiseSuppression: false",
+        "autoGainControl: false",
+        "getSettings",
+        "BEGIN StreamResampler16k",
+        "END StreamResampler16k",
+    ):
+        assert needle in html, f"missing {needle}"
+    assert "downsampleTo16k" not in html
+
+
 def test_app_threshold_precedence_verdict_and_min_window(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

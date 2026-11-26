@@ -9,6 +9,7 @@ checkpoints/
 artifacts/
 logs/
 *.wav
+results/live_capture/
 *.flac
 *.mp3
 *.ogg

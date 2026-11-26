@@ -1,0 +1,58 @@
+{
+  "manifest": "data/cloakbreak_v1/manifest.jsonl",
+  "model_path": "artifacts/session2/onnx/cloakbreak_fp32.onnx",
+  "generator": "bonafide_clean",
+  "split": "test",
+  "seed": 42,
+  "threshold": 0.95255,
+  "results": {
+    "None|naive": {
+      "hf_noise_dbfs": null,
+      "path": "naive",
+      "n_clips": 120,
+      "mean_score": 0.1672,
+      "p95_score": 0.9408,
+      "frac_ge_threshold": 0.0417
+    },
+    "None|proper": {
+      "hf_noise_dbfs": null,
+      "path": "proper",
+      "n_clips": 120,
+      "mean_score": 0.1682,
+      "p95_score": 0.9393,
+      "frac_ge_threshold": 0.0417
+    },
+    "-45.0|naive": {
+      "hf_noise_dbfs": -45.0,
+      "path": "naive",
+      "n_clips": 120,
+      "mean_score": 0.2415,
+      "p95_score": 0.9724,
+      "frac_ge_threshold": 0.0833
+    },
+    "-45.0|proper": {
+      "hf_noise_dbfs": -45.0,
+      "path": "proper",
+      "n_clips": 120,
+      "mean_score": 0.1732,
+      "p95_score": 0.9393,
+      "frac_ge_threshold": 0.0417
+    },
+    "-35.0|naive": {
+      "hf_noise_dbfs": -35.0,
+      "path": "naive",
+      "n_clips": 120,
+      "mean_score": 0.2595,
+      "p95_score": 0.9697,
+      "frac_ge_threshold": 0.075
+    },
+    "-35.0|proper": {
+      "hf_noise_dbfs": -35.0,
+      "path": "proper",
+      "n_clips": 120,
+      "mean_score": 0.181,
+      "p95_score": 0.9559,
+      "frac_ge_threshold": 0.0583
+    }
+  }
+}

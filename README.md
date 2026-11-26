@@ -136,9 +136,10 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 - GPU latency per 2.5 s window (torch, RTX 3090, test_clean): p50 20.7 ms, p95 23.6 ms.
 - CPU reproduction: fp32 ONNX on the 2-vCPU Oracle ARM VM gave the same val AUROC (0.9740) and EER (8.67%) as the Session 2 run, and the same test_clean EER (3.73%).
 - ARM CPU latency per 2.5 s window (fp32 ONNX, 2 threads, Oracle Neoverse-N1 with 2 vCPUs, 100 test clips): p50 702.1 ms, p95 1218.8 ms (`results/latency_oracle_arm_fp32.json`).
+- Browser fallback resampler (48 kHz sweep, compared with `scipy` `resample_poly`): aliasing from 8.5–20 kHz is −96.3 dB vs 0.0 dB for the old every-third-sample decimation, and the speech spectrum matches within 0.11 dB on average from 100 Hz to 7 kHz (`tests/test_resampler_js.py`).
 - Live stream on the same ARM VM (2 min, real time, fp32 ONNX): verdict lag p50 681.3 ms, p95 741.5 ms, max 796.5 ms, with one inference in flight at a time (`results/live_lag_oracle_arm_fp32.json`).
 - fp32 ONNX vs torch checkpoint on the 1,053 val clips: identical AUROC (0.9740) and EER (8.67%), max probability difference 0.0001.
-- 53 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
+- 62 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
 
 ## Honest Limits
 
@@ -158,6 +159,16 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
     - 187 windows were dropped as stale.
 
     The FAKE label also needs 2 of the last 3 scored windows at or above the threshold, so after a switch to fake speech it appears at least one extra verdict later. How long that takes end to end was not measured.
+12. **Live microphone false alarms are not solved for every mic.** In the author's own test, a real voice on a laptop mic in Chrome produced window scores between 0.05 and 1.00 and a LIKELY CLONE banner. Two causes in the old browser path are fixed:
+    - **Aliasing:** the page used to decimate to 16 kHz by keeping every Nth sample, which folds 8–24 kHz energy into the band the model hears. It now asks the browser for a 16 kHz `AudioContext` (band-limited resampling). Browsers that refuse that rate fall back to a 7.2 kHz windowed-sinc FIR before resampling.
+    - **Chrome's voice processing:** echo cancellation, noise suppression and auto gain are now requested off. The settings the browser actually applied are shown in the page footer.
+
+    What was measured after the fix (`results/sim_alias_fpr.json`, `results/live_mic_fakemic_clean_hf35.json`):
+    - **Aliasing matters, but it is not the whole story.** On 120 real LibriSpeech test clips upsampled to 48 kHz with 8.5–20 kHz noise at −45 dBFS, the old decimation flagged 8.33% of clips at the 0.9526 threshold; proper resampling flagged 4.17%, the same as with no added noise. At −35 dBFS: 7.50% vs 5.83%.
+    - **Headless Chrome live path:** 2 minutes of real LibriSpeech speech through Chrome's fake microphone (44.1 kHz device, 16 kHz context, voice processing off, −35 dBFS out-of-band noise added). 4 of 96 scored windows (4.17%) were at or above the threshold, and 4 smoothed verdicts were LIKELY CLONE. The same windows of the original 16 kHz audio gave 3 of 96 (3.13%). The scores the server logged matched an offline re-score of the captured audio (mean difference 0.0002).
+    - **Not verified on a real laptop mic.** Real room acoustics, mic frequency response and laptop noise are not in the training data. The fixed page has not been re-tested on the mic that produced the false alarms. Treat live-mic verdicts as unproven until a capture from that mic (see `CLOAKBREAK_DEBUG_CAPTURE` below) shows real speech staying under the threshold.
+
+    At the calibrated threshold, about 5% of real windows are expected to cross it by design (val FPR 4.93%).
 
 ## Repository Structure
 
@@ -185,6 +196,9 @@ cloakbreak/
 │   ├── preflight_vast.py       Import sweep, hidden-backend checks, GPU check
 │   ├── bench_latency.py        CPU latency benchmark for the ONNX model
 │   ├── bench_live_lag.py       End-to-end live verdict-lag benchmark (uvicorn + WebSocket client)
+│   ├── bench_live_mic.py       Headless-Chrome fake-mic run of the real browser audio path
+│   ├── replay_capture.py       Re-score a debug capture offline, window by window
+│   ├── sim_alias_fpr.py        Old vs fixed 48 kHz -> 16 kHz path on real clips
 │   ├── render_screenshots.py   Playwright screenshots of mocked demo states (not measurements)
 │   └── hf_auth_check.py        HF token role / namespace check
 ├── results/
@@ -192,6 +206,8 @@ cloakbreak/
 │   ├── calibration_cache/      Per-clip fp32 scores behind the calibration (val + test slices)
 │   ├── latency_oracle_arm_fp32.json
 │   ├── live_lag_oracle_arm_fp32.json
+│   ├── live_mic_fakemic_clean_hf35.json
+│   ├── sim_alias_fpr.json
 │   └── session2/               Session 2 eval JSON, results table, audits, parity, key lines
 ├── tests/                      CPU test suite
 ├── pyproject.toml             pytest config (pythonpath, testpaths)
@@ -213,6 +229,13 @@ bash -n scripts/*.sh
 .venv/bin/python -m src.calibrate --manifest data/cloakbreak_v1/manifest.jsonl \
   --backend onnx --model-path artifacts/session2/onnx/cloakbreak_fp32.onnx \
   --target-fpr 0.05 --max-per-slice 600 --out results/threshold_calibration.json
+
+# Debug a live-mic false alarm: save exactly what the server received, then re-score it offline
+CLOAKBREAK_DEBUG_CAPTURE=1 CLOAKBREAK_BACKEND=onnx \
+CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx \
+.venv/bin/uvicorn app.main:app --port 8000      # captures land in results/live_capture/ (gitignored)
+.venv/bin/python -m scripts.replay_capture --wav results/live_capture/<file>.wav \
+  --json results/live_capture/<file>.json --model-path artifacts/session2/onnx/cloakbreak_fp32.onnx
 
 # Vast sessions (run inside the tmux session Vast opens on SSH login)
 SMOKE=1 bash scripts/session2_vast.sh   # capped end-to-end check
