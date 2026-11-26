@@ -352,12 +352,14 @@ def test_eer_and_auroc_math() -> None:
 def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLOAKBREAK_BACKEND", "mock")
     monkeypatch.setenv("ENABLE_CLONE_ENDPOINT", "false")
+    # Force the legacy fallback path even when web/dist exists on disk. The
+    # single-file frontend itself was removed after the React rebuild, so the
+    # harmless fallback now reports that it is absent.
+    monkeypatch.setenv("CLOAKBREAK_WEB_DIST", "/nonexistent-web-dist")
     client = TestClient(create_app(AppState()))
 
     r_root = client.get("/")
-    assert r_root.status_code == 200
-    assert "CloakBreak" in r_root.text
-    assert "Model attention focus" in r_root.text
+    assert r_root.status_code == 404
 
     r_health = client.get("/api/health")
     assert r_health.status_code == 200
@@ -374,9 +376,15 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
     )
     assert r_det.status_code == 200
     det = r_det.json()
-    assert 0.0 <= det["spoof_prob"] <= 1.0
-    assert len(det["attention_focus"]) == 32
     assert det["condition"] == "opus_16k"
+    assert det["type"] == "upload"
+    assert det["n_windows"] == 1
+    assert det["n_speech"] == 1
+    w0 = det["windows"][0]
+    assert 0.0 <= w0["spoof_prob"] <= 1.0
+    assert len(w0["attention_focus"]) == 32
+    assert w0["is_speech"] is True
+    assert det["verdict"] in {"spoof", "bonafide"}
 
     assert client.post(
         "/api/clone",
@@ -440,52 +448,65 @@ def test_fastapi_mock_ws_and_clone_guardrails(monkeypatch: pytest.MonkeyPatch) -
         assert stats["total_sec"] == pytest.approx(2.0)
 
 
+def _web_src_text() -> str:
+    """Concatenate the React source files for static UI-contract assertions."""
+    src_dir = Path(__file__).resolve().parents[1] / "web" / "src"
+    return "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted(src_dir.rglob("*"))
+        if path.is_file() and path.suffix in {".ts", ".tsx", ".js"}
+    )
+
+
 def test_frontend_demo_page_static() -> None:
-    """Static contract for the demo-readable frontend (no server round-trip)."""
-    html = (Path(__file__).resolve().parents[1] / "frontend" / "index.html").read_text(encoding="utf-8")
-    assert "Simulate call channel" in html
+    """Static contract for the React demo UI copy and controls."""
+    src = _web_src_text()
+    assert "Simulate call channel" in src
     for label in ("Clean", "Opus 16 kbps (WhatsApp-like)", "Phone 8 kHz"):
-        assert f">{label}<" in html
-    # colors must come from the server threshold, not hard-coded cutoffs
-    assert "0.65" not in html and "0.35" not in html
-    for state in ("REAL VOICE", "LIKELY CLONE", "WARMING UP", "LISTENING"):
-        assert state in html
-    low = html.lower()
+        assert label in src
+    for state in ("REAL VOICE", "LIKELY CLONE", "LISTENING", "ANALYZING"):
+        assert state in src
+    low = src.lower()
     assert "where the model attended" in low
     assert "proof" not in low
-    # Try-samples tabs with ARIA wiring and the exact labels
-    assert 'role="tablist"' in html
-    for tab in ("Live mic (experimental)", "Upload a clip", "Try samples"):
-        assert tab in html
-    # honest-limit chips
-    for chip in (
-        "Noise: 16.6% EER at 10 dB SNR",
+    assert 'role="tablist"' in src
+    for tab in ("Try samples", "Upload or paste a link", "Live mic (experimental)"):
+        assert tab in src
+    assert "Experimental" in src
+    for copy in (
+        "Live mic can false-alarm on voices and mics unlike the training data",
+        "of all windows, ",
+        "of scored windows on the builder's own headset",
+        "Noisy audio: ",
         "Clips under 1 s: at chance",
-        "Live mic: false alarms on unfamiliar mics (21.8% of windows on the builder's headset)",
+        "Unseen voice cloners: accuracy drops",
+        "Live mic: false alarms on unfamiliar mics",
+        "Six test-split clips picked for the demo. Not a benchmark; see the results table in the README.",
+        "Experimental. Trained on speech from a few voice cloners. Music, noise and unseen cloners lower accuracy.",
     ):
-        assert chip in html
-    # verdict card always carries the false-alarm caveat
-    assert (
-        "Live mic can false-alarm on voices and mics unlike the training data "
-        "(21.8% of windows on the builder's own headset)." in html
-    )
-    assert "Experimental" in html
+        assert copy in src
 
 
 def test_frontend_mic_audio_path_static() -> None:
     """Static contract for the anti-aliased live-mic audio path."""
-    html = (Path(__file__).resolve().parents[1] / "frontend" / "index.html").read_text(encoding="utf-8")
+    src = _web_src_text()
     for needle in (
         "sampleRate: 16000",
         "echoCancellation: false",
         "noiseSuppression: false",
         "autoGainControl: false",
+        "channelCount: 1",
         "getSettings",
-        "BEGIN StreamResampler16k",
-        "END StreamResampler16k",
+        "createScriptProcessor",
+        "websocketUrl(\"/ws/detect\")",
+        "floatToPcm16",
     ):
-        assert needle in html, f"missing {needle}"
-    assert "downsampleTo16k" not in html
+        assert needle in src, f"missing {needle}"
+    resampler = (Path(__file__).resolve().parents[1] / "web" / "src" / "audio" / "streamResampler16k.js").read_text(encoding="utf-8")
+    assert "BEGIN StreamResampler16k" in resampler
+    assert "windowed-sinc anti-alias FIR" in resampler
+    assert "export class StreamResampler16k" in resampler
+    assert "downsampleTo16k" not in src
 
 
 def _write_sample_tree(root: Path, skip: str | None = None) -> dict[str, bytes]:
@@ -527,7 +548,8 @@ def test_samples_endpoints_list_detect_audio(
         assert s["available"] is True
         assert s["duration_s"] == pytest.approx(3.0, abs=0.05)
 
-    # Sample detect must equal detect-file on the same bytes, plus id/truth.
+    # Sample detect must equal detect-file on the same bytes, plus id/truth
+    # (the ffmpeg decode path is bit-exact for PCM16 WAV input).
     sid = "kokoro_00483"
     up = client.post(
         "/api/detect-file",
@@ -541,9 +563,12 @@ def test_samples_endpoints_list_detect_audio(
     sdet = sd.json()
     assert sdet["sample_id"] == sid
     assert sdet["truth"] == "clone"
+    assert sdet["type"] == "sample"
+    assert file_res["type"] == "upload"
     for key in (
-        "spoof_prob", "baseline_prob", "attention_focus", "backend",
-        "condition", "duration_s", "is_speech", "threshold", "verdict",
+        "backend", "condition", "duration_s", "threshold", "verdict",
+        "verdict_rule", "n_windows", "n_speech", "n_over_threshold",
+        "frac_over_threshold", "max_spoof_prob", "windows",
     ):
         assert sdet[key] == file_res[key], key
     # latency_ms is wall-clock and legitimately differs between calls.
@@ -656,8 +681,11 @@ def test_app_threshold_precedence_verdict_and_min_window(
     d = r.json()
     assert d["threshold"] == 0.33
     assert d["verdict"] in {"spoof", "bonafide"}
-    # verdict must be consistent with the reported prob and threshold
-    assert d["verdict"] == ("spoof" if d["spoof_prob"] >= d["threshold"] else "bonafide")
+    # a 2.5 s clip is a single speech window, which decides the verdict alone
+    assert d["n_speech"] == 1
+    w0 = d["windows"][0]
+    assert w0["spoof_prob"] is not None
+    assert d["verdict"] == ("spoof" if w0["spoof_prob"] >= d["threshold"] else "bonafide")
 
     # mock prob is in [0.02, 0.98]: 0.99 -> bonafide, 0.01 -> spoof
     monkeypatch.setenv("CLOAKBREAK_THRESHOLD", "0.99")

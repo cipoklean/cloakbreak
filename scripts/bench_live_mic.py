@@ -1,8 +1,9 @@
 """Live-mic path benchmark: real browser -> /ws/detect -> debug capture -> offline replay.
 
 Drives headless Chromium (Playwright) with Chrome's fake audio capture fed by a
-48 kHz WAV built from real manifest audio, clicks "Start Live Mic", records
-every WS prediction the page renders, then stops and analyzes:
+48 kHz WAV built from real manifest audio, opens the Live mic tab with the
+React UI's data-testid hooks, clicks "Start mic", records every WS prediction
+the page stores in its test log, then stops and analyzes:
 
   * live window-score distribution and LIKELY CLONE fraction (live FPR on
     known-real audio),
@@ -109,7 +110,7 @@ def _wait_health(port: int, timeout_s: float = 180.0) -> dict:
 
 
 def _browser_session(port: int, wav48: Path, minutes: float):
-    """Open the page, patch renderResult -> window.__cbLog, run the mic, stop."""
+    """Open the React page, run the fake mic through it, stop, return its WS log."""
     from playwright.sync_api import sync_playwright
 
     console_lines: list[str] = []
@@ -127,30 +128,21 @@ def _browser_session(port: int, wav48: Path, minutes: float):
             page = browser.new_page()
             page.on("console", lambda m: console_lines.append(m.text))
             page.goto(f"http://127.0.0.1:{port}/", wait_until="load")
-            page.wait_for_function("() => typeof window.renderResult === 'function'", timeout=15000)
-            page.evaluate(
-                """() => {
-                    window.__cbLog = [];
-                    const orig = window.renderResult;
-                    window.renderResult = function (d) {
-                        window.__cbLog.push(d);
-                        return orig.apply(this, arguments);
-                    };
-                }"""
-            )
-            page.click("#tab-live")  # mic controls live in the Live mic tab panel
-            page.click("#micBtn")
+            page.locator('[data-testid="tab-live"]').click()
+            page.locator('[data-testid="live-mic-button"]').click()
             page.wait_for_function(
-                "() => { const el = document.getElementById('micFooter');"
+                "() => { const el = document.querySelector('[data-testid=mic-settings-line]');"
                 " return el && el.textContent.includes('Mic:'); }",
                 timeout=30000,
             )
             time.sleep(minutes * 60.0)
-            footer = page.evaluate("() => document.getElementById('micFooter').textContent")
-            cb_log = page.evaluate("() => window.__cbLog")
-            page.click("#micBtn")  # stop -> ws close -> server writes capture
+            footer = page.evaluate(
+                "() => (document.querySelector('[data-testid=footer]') || {}).textContent || ''"
+            )
+            cb_log = page.evaluate("() => window.__cbLiveLog || []")
+            page.locator('[data-testid="live-mic-button"]').click()  # stop -> ws close -> server writes capture
             page.wait_for_function(
-                "() => document.getElementById('micBtn').textContent.includes('Start')",
+                "() => (document.querySelector('[data-testid=live-mic-button]') || {}).textContent?.includes('Start mic')",
                 timeout=15000,
             )
             time.sleep(1.0)  # let the ws close frame reach the server
@@ -235,7 +227,7 @@ def main() -> None:
         print(f"[bench] server up: backend={health.get('backend')} threshold={health.get('threshold')}", flush=True)
 
         footer, cb_log, console_lines = _browser_session(port, fake_wav, args.minutes)
-        print(f"[bench] browser session done; {len(cb_log)} renderResult payloads", flush=True)
+        print(f"[bench] browser session done; {len(cb_log)} websocket payloads", flush=True)
 
         cap_wav, cap_json = _wait_capture(caps_dir)
         print(f"[bench] capture: {cap_wav.name} + {cap_json.name}", flush=True)
@@ -289,7 +281,7 @@ def main() -> None:
         "health": health,
         "footer": footer,
         "resampler_mode": resampler_mode,
-        "n_render_result_payloads": len(cb_log),
+        "n_websocket_payloads": len(cb_log),
         "n_speech_verdicts": len(preds),
         "score_p50": _pct(scores, 50),
         "score_p95": _pct(scores, 95),

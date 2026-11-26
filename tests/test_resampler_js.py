@@ -1,9 +1,11 @@
 """Node-run checks for the JS ``StreamResampler16k`` fallback resampler.
 
-The block between ``// BEGIN StreamResampler16k`` / ``// END StreamResampler16k``
-in frontend/index.html is plain ES2015; this test extracts it, feeds float32
-audio through it in Node in 4096-sample chunks (same as the page), and
-compares against ``src.audio_utils.resample_audio``.
+The canonical implementation now lives in the ESM module
+``web/src/audio/streamResampler16k.js`` (extracted verbatim from the legacy
+static frontend it replaced). This test generates a
+small node runner that imports the module, feeds float32 audio through it in
+4096-sample chunks (same as the page), and compares against
+``src.audio_utils.resample_audio``.
 
 Skipped when ``node`` is not on PATH.
 """
@@ -21,22 +23,13 @@ from scipy.signal import butter, correlate, resample_poly, sosfiltfilt, welch
 from src.audio_utils import TARGET_SR, resample_audio
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FRONTEND_HTML = REPO_ROOT / "frontend" / "index.html"
+RESAMPLER_MODULE = REPO_ROOT / "web" / "src" / "audio" / "streamResampler16k.js"
 NODE = shutil.which("node")
 
 pytestmark = pytest.mark.skipif(NODE is None, reason="node executable not on PATH")
 
-BEGIN = "// BEGIN StreamResampler16k"
-END = "// END StreamResampler16k"
 DUR_S = 6.0
 CHUNK = 4096
-
-
-def _resampler_block() -> str:
-    html = FRONTEND_HTML.read_text(encoding="utf-8")
-    i = html.index(BEGIN)
-    j = html.index(END)
-    return html[i:j]
 
 
 def _expected_ntaps(in_rate: int) -> int:
@@ -47,15 +40,16 @@ def _expected_ntaps(in_rate: int) -> int:
 
 
 def _run_node(in_rate: int, samples: np.ndarray, tmp_path: Path, chunk: int = CHUNK) -> np.ndarray:
-    """Feed float32 samples through the JS resampler in Node; return float32 out."""
+    """Feed float32 samples through the JS resampler module in Node; return float32 out."""
     inp = tmp_path / f"in_{in_rate}_{chunk}.f32"
     outp = tmp_path / f"out_{in_rate}_{chunk}.f32"
-    drv = tmp_path / f"drv_{in_rate}_{chunk}.js"
+    drv = tmp_path / f"drv_{in_rate}_{chunk}.mjs"
     inp.write_bytes(samples.astype("<f4").tobytes())
+    module_url = RESAMPLER_MODULE.resolve().as_uri()
     drv.write_text(
-        _resampler_block()
-        + f"""
-const fs = require('fs');
+        f"""
+import fs from "node:fs";
+import {{ StreamResampler16k }} from "{module_url}";
 const buf = fs.readFileSync({str(inp)!r});
 const f32 = new Float32Array(buf.buffer, buf.byteOffset, Math.floor(buf.length / 4));
 const r = new StreamResampler16k({in_rate});
@@ -180,10 +174,14 @@ def _check_length(out: np.ndarray, dur_s: float) -> None:
     )
 
 
-def test_resampler_block_markers() -> None:
-    block = _resampler_block()
-    assert "class StreamResampler16k" in block
-    assert "passthrough" in block
+def test_resampler_module_shape() -> None:
+    assert RESAMPLER_MODULE.is_file()
+    src = RESAMPLER_MODULE.read_text(encoding="utf-8")
+    assert "export class StreamResampler16k" in src
+    assert "passthrough" in src
+    # dependency-free ES2015: no imports, no requires
+    assert "require(" not in src
+    assert "import " not in src
 
 
 @pytest.mark.parametrize("in_rate", [48000, 44100])

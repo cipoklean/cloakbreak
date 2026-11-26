@@ -2,92 +2,172 @@
   "threshold": 0.95255,
   "backend": "onnx:cloakbreak_fp32.onnx",
   "baseline_id": "Vansh180/deepfake-audio-wav2vec2",
-  "rows_desktop": [
+  "condition": "clean",
+  "source": "Values captured from the rendered React UI by scripts/render_screenshots.py",
+  "samples": [
     {
       "id": "kokoro_00483",
-      "name": "Kokoro clip 00483",
-      "truth": "Clone (Kokoro, unseen TTS)",
-      "cb": "1.000 Clone",
-      "legacy": "0.084 Real"
+      "overall_verdict": "Clone",
+      "max_window_score": "1.000",
+      "windows_over_threshold": "3/3",
+      "n_over_threshold": 3,
+      "n_speech": 3,
+      "truth_label": "Clone (Kokoro, unseen TTS)",
+      "windows": [
+        {
+          "index": 0,
+          "time": "0.0\u20132.5 s",
+          "cloakbreak": "1.000",
+          "legacy": "0.071",
+          "state": "Over"
+        },
+        {
+          "index": 1,
+          "time": "2.5\u20135.0 s",
+          "cloakbreak": "1.000",
+          "legacy": "0.080",
+          "state": "Over"
+        },
+        {
+          "index": 2,
+          "time": "5.0\u20137.5 s",
+          "cloakbreak": "0.995",
+          "legacy": "0.065",
+          "state": "Over"
+        }
+      ]
     },
     {
       "id": "kokoro_00069",
-      "name": "Kokoro clip 00069",
-      "truth": "Clone (Kokoro, unseen TTS)",
-      "cb": "0.995 Clone",
-      "legacy": "0.076 Real"
+      "overall_verdict": "Clone",
+      "max_window_score": "0.998",
+      "windows_over_threshold": "2/2",
+      "n_over_threshold": 2,
+      "n_speech": 2,
+      "truth_label": "Clone (Kokoro, unseen TTS)",
+      "windows": [
+        {
+          "index": 0,
+          "time": "0.0\u20132.5 s",
+          "cloakbreak": "0.998",
+          "legacy": "0.074",
+          "state": "Over"
+        },
+        {
+          "index": 1,
+          "time": "2.5\u20135.0 s",
+          "cloakbreak": "0.991",
+          "legacy": "0.072",
+          "state": "Over"
+        }
+      ]
     },
     {
       "id": "kokoro_00454",
-      "name": "Kokoro clip 00454",
-      "truth": "Clone (Kokoro, unseen TTS)",
-      "cb": "0.987 Clone",
-      "legacy": "0.066 Real"
+      "overall_verdict": "Clone",
+      "max_window_score": "0.996",
+      "windows_over_threshold": "2/2",
+      "n_over_threshold": 2,
+      "n_speech": 2,
+      "truth_label": "Clone (Kokoro, unseen TTS)",
+      "windows": [
+        {
+          "index": 0,
+          "time": "0.0\u20132.5 s",
+          "cloakbreak": "0.996",
+          "legacy": "0.068",
+          "state": "Over"
+        },
+        {
+          "index": 1,
+          "time": "2.5\u20135.0 s",
+          "cloakbreak": "0.977",
+          "legacy": "0.070",
+          "state": "Over"
+        }
+      ]
     },
     {
       "id": "ls_8463-294828-0031",
-      "name": "LibriSpeech 8463-294828-0031",
-      "truth": "Real (LibriSpeech)",
-      "cb": "0.000 Real",
-      "legacy": "0.084 Real"
+      "overall_verdict": "Real",
+      "max_window_score": "0.001",
+      "windows_over_threshold": "0/3",
+      "n_over_threshold": 0,
+      "n_speech": 3,
+      "truth_label": "Real (LibriSpeech)",
+      "windows": [
+        {
+          "index": 0,
+          "time": "0.0\u20132.5 s",
+          "cloakbreak": "0.001",
+          "legacy": "0.070",
+          "state": "Under"
+        },
+        {
+          "index": 1,
+          "time": "2.5\u20135.0 s",
+          "cloakbreak": "0.000",
+          "legacy": "0.078",
+          "state": "Under"
+        },
+        {
+          "index": 2,
+          "time": "5.0\u20137.5 s",
+          "cloakbreak": "0.000",
+          "legacy": "0.072",
+          "state": "Under"
+        }
+      ]
     },
     {
       "id": "ls_8455-210777-0040",
-      "name": "LibriSpeech 8455-210777-0040",
-      "truth": "Real (LibriSpeech)",
-      "cb": "0.007 Real",
-      "legacy": "0.110 Real"
+      "overall_verdict": "Real",
+      "max_window_score": "0.064",
+      "windows_over_threshold": "0/2",
+      "n_over_threshold": 0,
+      "n_speech": 2,
+      "truth_label": "Real (LibriSpeech)",
+      "windows": [
+        {
+          "index": 0,
+          "time": "0.0\u20132.5 s",
+          "cloakbreak": "0.000",
+          "legacy": "0.123",
+          "state": "Under"
+        },
+        {
+          "index": 1,
+          "time": "2.5\u20135.0 s",
+          "cloakbreak": "0.064",
+          "legacy": "0.086",
+          "state": "Under"
+        }
+      ]
     },
     {
       "id": "ls_672-122797-0057",
-      "name": "LibriSpeech 672-122797-0057",
-      "truth": "Real (LibriSpeech)",
-      "cb": "0.000 Real",
-      "legacy": "0.237 Real"
-    }
-  ],
-  "rows_mobile": [
-    {
-      "id": "kokoro_00483",
-      "name": "Kokoro clip 00483",
-      "truth": "Clone (Kokoro, unseen TTS)",
-      "cb": "1.000 Clone",
-      "legacy": "0.084 Real"
-    },
-    {
-      "id": "kokoro_00069",
-      "name": "Kokoro clip 00069",
-      "truth": "Clone (Kokoro, unseen TTS)",
-      "cb": "0.995 Clone",
-      "legacy": "0.076 Real"
-    },
-    {
-      "id": "kokoro_00454",
-      "name": "Kokoro clip 00454",
-      "truth": "Clone (Kokoro, unseen TTS)",
-      "cb": "0.987 Clone",
-      "legacy": "0.066 Real"
-    },
-    {
-      "id": "ls_8463-294828-0031",
-      "name": "LibriSpeech 8463-294828-0031",
-      "truth": "Real (LibriSpeech)",
-      "cb": "0.000 Real",
-      "legacy": "0.084 Real"
-    },
-    {
-      "id": "ls_8455-210777-0040",
-      "name": "LibriSpeech 8455-210777-0040",
-      "truth": "Real (LibriSpeech)",
-      "cb": "0.007 Real",
-      "legacy": "0.110 Real"
-    },
-    {
-      "id": "ls_672-122797-0057",
-      "name": "LibriSpeech 672-122797-0057",
-      "truth": "Real (LibriSpeech)",
-      "cb": "0.000 Real",
-      "legacy": "0.237 Real"
+      "overall_verdict": "Real",
+      "max_window_score": "0.001",
+      "windows_over_threshold": "0/2",
+      "n_over_threshold": 0,
+      "n_speech": 2,
+      "truth_label": "Real (LibriSpeech)",
+      "windows": [
+        {
+          "index": 0,
+          "time": "0.0\u20132.5 s",
+          "cloakbreak": "0.001",
+          "legacy": "0.277",
+          "state": "Under"
+        },
+        {
+          "index": 1,
+          "time": "2.5\u20135.0 s",
+          "cloakbreak": "0.000",
+          "legacy": "0.097",
+          "state": "Under"
+        }
+      ]
     }
   ]
 }

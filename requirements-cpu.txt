@@ -41,3 +41,4 @@ python-multipart==0.0.34
 pydantic==2.14.4
 pytest>=8.3.0,<10.0.0
 httpx==0.28.1
+yt-dlp==2026.10.26

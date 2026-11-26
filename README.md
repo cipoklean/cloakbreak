@@ -20,11 +20,11 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
 ```
  Session 1 (Vast RTX 4090)                Session 2 (Vast RTX 3090)               Demo (Oracle ARM, CPU)
  ─────────────────────────                ─────────────────────────               ──────────────────────
- InTheWild (real + spoof) ─┐              restore dataset (19,288 clips)          mic / file
+ InTheWild (real + spoof) ─┐              restore dataset (19,288 clips)          mic / file / link
  LibriSpeech clean (real) ─┼─► loudness   │                                       │
  Chatterbox-Turbo clones ──┤   + 2.5-10 s ▼                                       ▼
-   (watermark disabled,    │   normalize  shortcut gate: trivial 4-feature        newest 2.5 s window
-    disjoint text)         │              classifier on AUGMENTED windows          (decisions only after >= 2 s)
+   (watermark disabled,    │   normalize  shortcut gate: trivial 4-feature        newest live / upload windows
+    disjoint text)         │              classifier on AUGMENTED windows          (live decisions only after >= 2 s)
  Kokoro-82M (held out, ────┘              must score AUROC < 0.60                  │
    test only, disjoint text)              │                                       ▼
                                           ▼                                       fp32 ONNX WavLM detector
@@ -49,24 +49,29 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
 | Shortcut audit | `src/eval.py` | Logistic classifier on duration, RMS, estimated SNR and spectral rolloff, run as a hard gate before training |
 | Threshold calibration | `src/calibrate.py` | Picks the operating threshold on the val split only; reports test FPR/TPR without tuning on test |
 | Hugging Face Hub (private) | `src/hub.py`, `src/restore_dataset.py` | Synthetic clips, per-epoch checkpoints (preemption-safe resume), ONNX, results, logs |
-| FastAPI + WebSocket | `app/main.py`, `src/live.py`, `frontend/index.html` | Live demo: one inference at a time on the newest window, stale windows dropped, 2-of-3 smoothed verdict at the calibrated threshold, raw window score, freshness (lag + inference ms), attention focus |
+| React + TypeScript UI | `web/src/` | Three-tab demo (Try samples, Upload or paste a link, Live mic), per-window timeline, attention view, honest-limit numbers fetched from `/api/facts` |
+| FastAPI job queue + WebSocket | `app/main.py`, `src/jobs.py`, `src/live.py` | One file/sample/link analysis at a time in FIFO order; live mic uses one inference at a time on the newest window, drops stale windows, and smooths the verdict with the calibrated threshold |
 
 ## Try It in 5 Minutes
 
-The running app after scoring the six Try samples clips (fp32 ONNX on the Oracle ARM VM, Clean channel, legacy detector loaded):
+The running app after analyzing the six Try samples clips (fp32 ONNX on the Oracle ARM VM, Clean channel, legacy detector loaded):
 
-![CloakBreak Try samples tab with real scores: three Kokoro clones flagged by CloakBreak and missed by the legacy detector, three LibriSpeech clips scored real by both](docs/screenshots/real-try-samples-desktop.png)
+![CloakBreak React UI showing a Kokoro clone analysis: red LIKELY CLONE verdict, CloakBreak 1.000 versus legacy detector 0.080, per-window timeline and attention focus](docs/screenshots/real-samples-kokoro-desktop.png)
 
-*Real screenshot with real scores, rendered by `scripts/render_screenshots.py`; the displayed values are saved in [`results/try_samples_real.json`](results/try_samples_real.json). The six clips are test-split files picked for the demo, not a benchmark. Also: [mobile](docs/screenshots/real-try-samples-mobile.png). Live-mic states are mocked and carry a MOCK ribbon in the image: [clone](docs/screenshots/mock-live-clone-desktop.png), [warming up](docs/screenshots/mock-live-warming-mobile.png).*
+*Real screenshot with real scores from the new all-window analysis UI, rendered by `scripts/render_screenshots.py`; the displayed values are saved in [`results/try_samples_real.json`](results/try_samples_real.json). The six clips are test-split files picked for the demo, not a benchmark. More real captures: [Kokoro mobile](docs/screenshots/real-samples-kokoro-mobile.png), [LibriSpeech desktop](docs/screenshots/real-samples-librispeech-desktop.png), [LibriSpeech mobile](docs/screenshots/real-samples-librispeech-mobile.png), [upload desktop](docs/screenshots/real-upload-desktop.png), [upload mobile](docs/screenshots/real-upload-mobile.png), [busy-queue desktop](docs/screenshots/real-busy-desktop.png), [busy-queue mobile](docs/screenshots/real-busy-mobile.png).*
 
-| Try samples clip | Ground truth | CloakBreak (threshold 0.9526) | Legacy detector (cutoff 0.5) |
-| :--- | :--- | :---: | :---: |
-| kokoro_00483 | Clone (Kokoro, unseen TTS) | 1.000 Clone | 0.084 Real |
-| kokoro_00069 | Clone (Kokoro, unseen TTS) | 0.995 Clone | 0.076 Real |
-| kokoro_00454 | Clone (Kokoro, unseen TTS) | 0.987 Clone | 0.066 Real |
-| LibriSpeech 8463-294828-0031 | Real | 0.000 Real | 0.084 Real |
-| LibriSpeech 8455-210777-0040 | Real | 0.007 Real | 0.110 Real |
-| LibriSpeech 672-122797-0057 | Real | 0.000 Real | 0.237 Real |
+Per-window analysis at threshold 0.9526 (`CloakBreak / legacy` for each scored 2.5 s window; the legacy cutoff is 0.5):
+
+| Try samples clip | Ground truth | Overall verdict | Max window score | Windows over threshold | Window scores |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| kokoro_00483 | Clone (Kokoro, unseen TTS) | Clone | 1.000 | 3/3 | 1.000/0.071 · 1.000/0.080 · 0.995/0.065 |
+| kokoro_00069 | Clone (Kokoro, unseen TTS) | Clone | 0.998 | 2/2 | 0.998/0.074 · 0.991/0.072 |
+| kokoro_00454 | Clone (Kokoro, unseen TTS) | Clone | 0.996 | 2/2 | 0.996/0.068 · 0.977/0.070 |
+| LibriSpeech 8463-294828-0031 | Real | Real | 0.001 | 0/3 | 0.001/0.070 · 0.000/0.078 · 0.000/0.072 |
+| LibriSpeech 8455-210777-0040 | Real | Real | 0.064 | 0/2 | 0.000/0.123 · 0.064/0.086 |
+| LibriSpeech 672-122797-0057 | Real | Real | 0.001 | 0/2 | 0.001/0.277 · 0.000/0.097 |
+
+These are six hand-picked clips for the demo, not a benchmark; use the evaluation tables below for measured performance.
 
 1. Clone and install the CPU stack (the tests were run with Python 3.11 and `torch 2.15.0+cpu`):
    ```bash
@@ -75,23 +80,58 @@ The running app after scoring the six Try samples clips (fp32 ONNX on the Oracle
    .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
    .venv/bin/pip install -r requirements-cpu.txt
    ```
-2. Run the test suite (no GPU or downloads needed):
+   `requirements-cpu.txt` includes `yt-dlp` for link analysis. Install `ffmpeg` too — on Debian/Ubuntu: `sudo apt install ffmpeg` — because uploads and downloaded links are decoded through it.
+2. Build the React UI (Node 20+; this checkout was built with Node 24):
+   ```bash
+   cd web
+   npm ci
+   npm run build
+   cd ..
+   ```
+   This writes `web/dist/` (gitignored). You do not need a separate frontend server for normal use.
+3. Run the test suite (no GPU or downloads needed):
    ```bash
    .venv/bin/python -m pytest -q
    ```
-3. Start the demo UI with the built-in mock backend:
+4. Start the demo UI with the built-in mock backend:
    ```bash
    CLOAKBREAK_BACKEND=mock .venv/bin/uvicorn app.main:app --port 8000
    ```
-   Open `http://localhost:8000`. The page has three tabs: **Try samples** (default), **Upload a clip** and **Live mic (experimental)**. In the Live mic tab, allow the microphone and talk for at least 2 seconds; the UI shows the smoothed verdict, the raw score of each window, how old the scored audio is, and your input level against the speech gate.
-4. With the trained model (weights are in the private repo `Cipoklean/cloakbreak-wavlm`; access required):
+   Open `http://localhost:8000` — one uvicorn process serves both the API and the built React UI at the same URL. The page has three tabs: **Try samples** (default), **Upload or paste a link** and **Live mic (experimental)**. In the Live mic tab, allow the microphone and talk for at least 2 seconds; the UI shows the smoothed verdict, the raw score of each window, how old the scored audio is, and your input level against the speech gate.
+5. With the trained model (weights are in the private repo `Cipoklean/cloakbreak-wavlm`; access required):
    ```bash
    .venv/bin/hf download Cipoklean/cloakbreak-wavlm onnx/cloakbreak_fp32.onnx --local-dir artifacts/session2
    CLOAKBREAK_BACKEND=onnx \
    CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx \
+   CLOAKBREAK_BASELINE_ID=Vansh180/deepfake-audio-wav2vec2 \
    .venv/bin/uvicorn app.main:app --port 8000
    ```
-   Add `CLOAKBREAK_BASELINE_ID=Vansh180/deepfake-audio-wav2vec2` to show the legacy detector next to CloakBreak. The Try samples tab reads its six clips from `data/cloakbreak_v1/` (restore it first, see [Local Development](#local-development--verification)); clips that are missing show as "not restored". `/api/health` reports the threshold in use. `results/threshold_calibration.json` is loaded automatically only when its `model_sha256` matches the model file; otherwise the app falls back to 0.5 and reports it.
+   Omit `CLOAKBREAK_BASELINE_ID` if you do not want the legacy detector. The Try samples tab reads its six clips from `data/cloakbreak_v1/` (restore it first, see [Local Development](#local-development--verification)); clips that are missing show as "not restored". `/api/health` reports the threshold in use. `results/threshold_calibration.json` is loaded automatically only when its `model_sha256` matches the model file; otherwise the app falls back to 0.5 and reports it.
+
+   For frontend development instead of a production build, keep uvicorn on port 8765 and run Vite separately:
+   ```bash
+   CLOAKBREAK_BACKEND=mock .venv/bin/uvicorn app.main:app --port 8765
+   cd web && npm run dev
+   ```
+   Vite serves the UI on its own local URL and proxies `/api` plus `/ws` to `http://localhost:8765` (`CLOAKBREAK_PROXY_TARGET` overrides that target).
+
+## Public demo with a Cloudflare quick tunnel
+
+A Cloudflare quick tunnel gives a temporary public `https://*.trycloudflare.com` URL with no account or signup. Start the app on port 8765 in one terminal:
+
+```bash
+CLOAKBREAK_BACKEND=onnx \
+CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx \
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8765
+```
+
+In a second terminal, start the tunnel:
+
+```bash
+bash scripts/public_tunnel.sh
+```
+
+Share the `trycloudflare.com` URL printed by cloudflared. The script checks `/api/health`, refuses to run if `ENABLE_CLONE_ENDPOINT=true` is set in the shell, and execs `cloudflared tunnel --url http://localhost:8765`. Set `CLOAKBREAK_PORT` to use another local port. Anyone with the URL can use the demo: live-mic audio is sent to your machine for scoring, analyses share one FIFO worker, and only one browser can use the live mic at a time. Stop the tunnel with Ctrl+C when the demo is over. The clone endpoint must stay off for a public tunnel.
 
 ## Safety, Privacy & Guardrails
 
@@ -102,7 +142,11 @@ The running app after scoring the six Try samples clips (fp32 ONNX on the Oracle
 5. The attention view shows where the model focused. It is not proof that a particular stretch of audio is fake.
 6. A verdict is a risk signal, not proof. See Honest Limits before relying on it.
 7. Try samples serves six allowlisted clip IDs only (`GET /api/samples`, `POST /api/samples/{id}/detect`, `GET /api/samples/{id}/audio`); the server never accepts a file path from the client. The clip audio is not in the repository.
-8. Live-mic debug capture (`CLOAKBREAK_DEBUG_CAPTURE=1`) is off by default and writes to `results/live_capture/`, which is gitignored.
+8. File, sample and link analyses share one FIFO worker: only one analysis job is scored at a time, queued clients are shown their position, at most 10 unfinished jobs are accepted (the 11th gets HTTP 429), and finished results expire after 10 minutes.
+9. Only one browser can use the live mic at a time. A second websocket gets the explicit busy message "Someone else is using the mic. Try again in a moment."
+10. Link analysis validates the pasted URL before queueing it: only http/https with a real hostname and no userinfo, and every resolved IP must be public unicast; private, loopback, link-local, cloud-metadata, multicast, reserved and unspecified addresses are refused. It does not revalidate redirect targets after yt-dlp starts downloading, so redirect-based SSRF is a known residual risk. Do not expose link analysis from a machine where lateral network access matters.
+11. Uploads are limited to 50 MB and analysis covers at most the first 60 seconds; ffmpeg decode failures return a user-facing error rather than a server traceback.
+12. Live-mic audio is streamed to the server for scoring and is not stored by default. Debug capture (`CLOAKBREAK_DEBUG_CAPTURE=1`) is off by default and, when enabled, writes to `results/live_capture/`, which is gitignored.
 
 ## Engineering Highlights (Verified)
 
@@ -150,9 +194,9 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 - Browser fallback resampler (48 kHz sweep, compared with `scipy` `resample_poly`): aliasing from 8.5–20 kHz is −96.3 dB vs 0.0 dB for the old every-third-sample decimation, and the speech spectrum matches within 0.11 dB on average from 100 Hz to 7 kHz (`tests/test_resampler_js.py`).
 - Live stream on the same ARM VM (2 min, real time, fp32 ONNX): verdict lag p50 681.3 ms, p95 741.5 ms, max 796.5 ms, with one inference in flight at a time (`results/live_lag_oracle_arm_fp32.json`).
 - fp32 ONNX vs torch checkpoint on the 1,053 val clips: identical AUROC (0.9740) and EER (8.67%), max probability difference 0.0001.
-- Try samples in the running app (fp32 ONNX on the ARM VM): the three Kokoro clips scored 0.987–1.000 (Clone) while the legacy detector scored them 0.066–0.084 (Real); the three LibriSpeech clips scored 0.000–0.007 (Real). Six hand-picked clips, not a benchmark (`results/try_samples_real.json`).
+- Try samples in the running app (fp32 ONNX on the ARM VM): the three Kokoro clips had max window scores 0.996–1.000 (overall Clone) while their legacy windows scored 0.065–0.080 (Real); the three LibriSpeech clips had max window scores 0.001–0.064 (overall Real). Six hand-picked clips, not a benchmark (`results/try_samples_real.json`).
 - Builder's headset capture (29.8 s, real voice): 12 of 55 windows at or above the threshold (21.8%), see Honest Limits #12 (`results/live_mic_headset_ab17x_grid.json`).
-- 72 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
+- 106 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
 
 ## Honest Limits
 
@@ -165,14 +209,14 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 7. **Channel shortcuts are reduced, not gone.** On test model windows, the trivial 4-feature classifier still reaches AUROC 0.7084 (EER 36.03%). The rolloff-matched slice (6.78% EER) shows that the model does not depend only on spectral rolloff.
 8. **The baseline is not a strong competitor.** Its config maps `0=real, 1=fake`, and CloakBreak reads the `fake` probability (unit-tested with both label orders). Its model card says it was trained on ASVspoof 2021 PA, a replay-attack set, so it is out of its domain on TTS clones. It flags only 0.17% of clean human clips at 0.5, which shows its labels are not flipped. It is the legacy reference, not a state-of-the-art comparison.
 9. **Opus results vary slightly with the ffmpeg/libopus build.** On the ARM VM re-run, test_opus_16k EER was 6.10% (5.76% on the Vast box) and unseen_kokoro_opus_16k was 3.67% (3.33%).
-10. **One model, one seed, about 600 clips per slice.** There are no confidence intervals. Each decision looks at a single 2.5 s window (for files, the center 2.5 s).
+10. **One model, one seed, about 600 clips per slice.** There are no confidence intervals. Each live decision looks at a single newest 2.5 s window; file, sample and link analyses score non-overlapping 2.5 s speech windows and apply the same 2-of-3 consecutive-window rule.
 11. **On the ARM demo VM, verdicts are about 0.7 s behind live audio and arrive about every 0.63 s, not every 0.25 s.** In this run one fp32 window took 632.9 ms at p50 (702.1 ms in the separate 100-clip latency benchmark above). The live scorer runs one inference at a time, always on the newest 2.5 s window, and drops windows that went stale while it was busy. In a 2-minute real-time stream on the 2-vCPU Oracle VM (client and server on the same VM, 185 verdicts, `results/live_lag_oracle_arm_fp32.json`):
     - verdict lag, from sending the window's last audio sample to receiving its verdict: p50 681.3 ms, p95 741.5 ms, max 796.5 ms;
     - the lag did not grow: p95 was 742.2 ms in the first half of the stream and 736.1 ms in the second;
     - 187 windows were dropped as stale.
 
     The FAKE label also needs 2 of the last 3 scored windows at or above the threshold, so after a switch to fake speech it appears at least one extra verdict later. How long that takes end to end was not measured.
-12. **Live mic false-alarms on the builder's own headset: 21.8% of windows.** No retraining was done for this; the model and the 0.9526 threshold are unchanged.
+12. **Live mic false-alarms on the builder's own headset: 21.8% of all windows (26.7% of gate-passed windows).** No retraining was done for this; the model and the 0.9526 threshold are unchanged.
     - **How it was measured:** a 29.8 s capture of the author's real voice (AB17X USB headset, Brave, voice processing off, `CLOAKBREAK_DEBUG_CAPTURE=1`). The capture was re-scored offline with the app's own scoring path (fp32 ONNX, Clean channel) on every 2.5 s window at a 0.5 s hop, ignoring the speech gate (`scripts/rescore_capture_grid.py`; per-window scores and levels in `results/live_mic_headset_ab17x_grid.json`; the audio itself is not committed).
     - **Result:** 12 of 55 windows (21.8%) scored at or above 0.9526; median score 0.246. The new speech gate passes 45 of the 55 windows, and all 12 false alarms are among them (26.7% of gated windows). The legacy detector crossed 0.5 on 3 of 55 windows, all of them silent windows the gate skips.
     - **Why the live app showed nothing during that test:** the headset delivered speech at about −39 to −45 dBFS per window with auto gain off, below the old fixed speech gate (RMS 0.012, about −38.4 dBFS), so all 55 windows were rejected as silence. The gate now tracks the noise floor (10th percentile of 0.25 s block levels over the last 10 s) and opens 6 dB above it, never below −60 dBFS; with too little history it uses −50 dBFS. A fixed −50 dBFS gate was rejected because this headset's silent windows sit at −49 to −52 dBFS. The gate only decides which windows get scored: the scored audio is loudness-normalized to about −23 dBFS RMS before the model sees it, as in training, so input level by itself does not change the score.
@@ -185,10 +229,17 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 
 ```
 cloakbreak/
-├── app/main.py                 FastAPI app: detect-file, allowlisted samples, WebSocket stream, private clone endpoint (off)
-├── frontend/index.html         Demo UI (single static file): Try samples, Upload a clip, Live mic
-├── docs/screenshots/           real-* = real app screenshots with real scores; mock-* = labeled MOCK in the image
+├── app/main.py                 FastAPI app: analysis jobs, allowlisted samples, analyze-url, WebSocket stream, private clone endpoint (off)
+├── web/
+│   ├── src/App.tsx             React app shell: tabs, shared channel selector, verdict state, polling
+│   ├── src/components/         Samples, upload/link, live mic, verdict, detector cards, timeline, attention, honest limits
+│   ├── src/audio/streamResampler16k.js   Windowed-sinc anti-alias fallback for non-16 kHz AudioContexts
+│   ├── package.json / package-lock.json  React 19 + Vite + TypeScript + Tailwind v4 dependencies
+│   └── vite.config.ts          Production build and dev proxy for /api + /ws
+├── docs/screenshots/           Eight real-* app screenshots with real scores (desktop + mobile)
 ├── src/
+│   ├── analysis.py             All-window clip analysis: speech-gated non-overlapping windows, 2-of-3 verdict
+│   ├── jobs.py                 FIFO single-worker job queue, ffmpeg decode, yt-dlp download, SSRF guard
 │   ├── audio_utils.py          Loading, loudness normalization, rolling buffer, noise-floor speech gate, SNR / rolloff features
 │   ├── augment.py              Codec, phone, noise, clipping and spectral augmentation; Opus cache
 │   ├── generate_spoofs.py      Session 1 dataset builder (InTheWild, LibriSpeech, Chatterbox, Kokoro)
@@ -211,7 +262,8 @@ cloakbreak/
 │   ├── replay_capture.py       Re-score a debug capture offline, window by window
 │   ├── rescore_capture_grid.py Re-score a capture on a fixed window grid and replay it through the speech gate
 │   ├── sim_alias_fpr.py        Old vs fixed 48 kHz -> 16 kHz path on real clips
-│   ├── render_screenshots.py   Playwright screenshots: real Try samples run, or --mock live-mic states
+│   ├── render_screenshots.py   Real-backend Playwright screenshots + try_samples_real.json regeneration
+│   ├── public_tunnel.sh        Cloudflare quick-tunnel helper for a temporary public demo
 │   └── hf_auth_check.py        HF token role / namespace check
 ├── results/
 │   ├── threshold_calibration.json   Val-selected threshold + test FPR/TPR (CPU re-run)
@@ -220,11 +272,11 @@ cloakbreak/
 │   ├── live_lag_oracle_arm_fp32.json
 │   ├── live_mic_fakemic_clean_hf35.json
 │   ├── live_mic_headset_ab17x_grid.json   Builder's headset capture, re-scored per window
-│   ├── try_samples_real.json    Scores the app displayed for the six Try samples clips
+│   ├── try_samples_real.json    Per-window scores the React app displayed for the six Try samples clips
 │   ├── sim_alias_fpr.json
 │   └── session2/               Session 2 eval JSON, results table, audits, parity, key lines
 ├── tests/                      CPU test suite
-├── pyproject.toml             pytest config (pythonpath, testpaths)
+├── pyproject.toml              pytest config (pythonpath, testpaths)
 ├── requirements-cpu.txt / requirements-gpu.txt / requirements-gpu.lock
 └── SUBMISSION_LOG.md           Vast session ledger
 ```
@@ -232,6 +284,9 @@ cloakbreak/
 ## Local Development & Verification
 
 ```bash
+# React UI lint + production build (writes the gitignored web/dist/)
+cd web && npm ci && npm run lint && npm run build && cd ..
+
 # CPU tests (pinned env: numpy 1.26.4, pyarrow 25.0.0, pandas 3.0.6, datasets 5.2.0, transformers 5.2.0)
 .venv/bin/python -m pytest -v
 bash -n scripts/*.sh
@@ -254,9 +309,8 @@ CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx \
 .venv/bin/python -m scripts.rescore_capture_grid --wav results/live_capture/<file>.wav \
   --baseline-id Vansh180/deepfake-audio-wav2vec2 --out results/<name>.json
 
-# Screenshots (Playwright via uv, not a project dependency): real Try samples run, then mocked live-mic states
+# Screenshots + results/try_samples_real.json (Playwright via uv, not a project dependency; real backend only)
 uv run --with playwright==1.65.2 python scripts/render_screenshots.py
-uv run --with playwright==1.65.2 python scripts/render_screenshots.py --mock
 
 # Vast sessions (run inside the tmux session Vast opens on SSH login)
 SMOKE=1 bash scripts/session2_vast.sh   # capped end-to-end check

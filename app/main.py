@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,19 +15,32 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.staticfiles import StaticFiles
 
+from src.analysis import analyze_clip
 from src.audio_utils import (
     TARGET_SR,
     load_wav_bytes_mono,
+    load_wav_mono,
     pcm16_bytes_to_float32,
     resample_audio,
-    rms_vad,
     save_wav_mono,
     wav_to_bytes,
 )
 from src.augment import EvalCondition, degrade_for_eval
+from src.jobs import (
+    ALLOWED_UPLOAD_EXTS,
+    DECODE_ERROR_MESSAGE,
+    MAX_JOB_UPLOAD_BYTES,
+    JobQueue,
+    QueueFullError,
+    decode_to_mono16k,
+    download_video_audio,
+    url_validation_error,
+)
 from src.live import LiveScorer
 from src.model import (
     BaselineDetectorRuntime,
@@ -109,6 +123,10 @@ class AppState:
         self.detector: DetectorRuntime = self._init_detector()
         self.baseline: Optional[BaselineDetectorRuntime] = self._init_baseline()
         self._chatterbox_model = None
+        # One live mic session at a time: nonzero while a /ws/detect handler
+        # is active; guarded by the lock since connect/disconnect interleave.
+        self.live_ws_sessions = 0
+        self.live_ws_lock = threading.Lock()
 
     def _resolve_threshold(self) -> tuple[float, str]:
         env_raw = os.getenv("CLOAKBREAK_THRESHOLD", "").strip()
@@ -181,51 +199,276 @@ def _write_live_capture(capture_dir: Path, cap: dict) -> Path:
     return wav_path
 
 
-def _score_upload(ctx: AppState, raw: bytes, condition: EvalCondition) -> dict:
-    """Score raw WAV bytes — the shared path behind /api/detect-file and samples."""
-    if len(raw) == 0 or len(raw) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="Audio file must be non-empty and <= 5 MB")
-    try:
-        wav, sr = load_wav_bytes_mono(raw, target_sr=TARGET_SR)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid WAV audio: {exc}") from exc
+ANALYSIS_CONDITIONS = {
+    "clean", "opus_16k", "phone_8k", "noise_10db", "noise_5db", "short_0.5s", "short_0.8s",
+}
+QUEUE_FULL_DETAIL = "Too many analyses in flight. Try again in a moment."
 
-    if wav.shape[0] / float(TARGET_SR) < ctx.min_window_sec:
+
+def _validate_condition(value: object) -> EvalCondition:
+    cond = value if isinstance(value, str) and value.strip() else "clean"
+    cond = cond.strip()
+    if cond not in ANALYSIS_CONDITIONS:
+        raise HTTPException(status_code=422, detail=f"unknown condition {cond!r}")
+    return cond  # type: ignore[return-value]
+
+
+async def _read_payload(request: Request) -> dict:
+    """Leniently read a small JSON-or-form POST payload as a plain dict."""
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        try:
+            body = await request.json()
+        except Exception:
+            return {}
+        return body if isinstance(body, dict) else {}
+    try:
+        form = await request.form()
+    except Exception:
+        return {}
+    return {k: v for k, v in form.items()}
+
+
+async def _stage_upload(file: UploadFile, enforce_ext: bool = True) -> tuple[tempfile.TemporaryDirectory, Path]:
+    """Stream an upload into a fresh TemporaryDirectory (caller transfers ownership
+    to the job, or cleans up itself on failure). Enforces extension + size caps.
+
+    The sync /api/detect-file compat endpoint passes enforce_ext=False: its
+    legacy contract never inspected the filename, only the bytes.
+    """
+    filename = file.filename or ""
+    ext = Path(filename).suffix.lower()
+    if enforce_ext and ext not in ALLOWED_UPLOAD_EXTS:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"need at least {ctx.min_window_sec:.1f} s of audio "
-                "(clips under 1 s are at chance)"
+                f"Unsupported file type {ext or '(no extension)'!r}. "
+                "Use one of: .wav, .mp3, .m4a, .mp4, .webm, .ogg"
             ),
         )
-    if wav.shape[0] > TARGET_SR * 20:
-        wav = wav[: TARGET_SR * 20]
-    degraded = degrade_for_eval(wav, condition=condition, sr=sr)
-    res = ctx.detector.predict(degraded)
-    baseline_prob = ctx.baseline.predict_prob(degraded) if ctx.baseline is not None else None
-    return {
-        "spoof_prob": res.spoof_prob,
-        "baseline_prob": baseline_prob,
-        "attention_focus": res.attention_focus,
-        "latency_ms": res.latency_ms,
-        "backend": res.backend,
-        "condition": condition,
-        "duration_s": round(degraded.shape[0] / float(TARGET_SR), 2),
-        "is_speech": rms_vad(degraded),
-        "threshold": ctx.threshold,
-        "verdict": "spoof" if res.spoof_prob >= ctx.threshold else "bonafide",
-    }
+    tmpdir = tempfile.TemporaryDirectory()
+    inp = Path(tmpdir.name) / f"input{ext or '.bin'}"
+    size = 0
+    try:
+        with open(inp, "wb") as fh:
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_JOB_UPLOAD_BYTES:
+                    raise HTTPException(status_code=413, detail="File too large (max 50 MB)")
+                fh.write(chunk)
+    except Exception:
+        tmpdir.cleanup()
+        raise
+    if size == 0:
+        tmpdir.cleanup()
+        raise HTTPException(status_code=400, detail="The uploaded file is empty")
+    return tmpdir, inp
+
+
+def _analyze_with_ctx(ctx: AppState, wav: np.ndarray, condition: EvalCondition, **meta) -> dict:
+    return analyze_clip(
+        wav,
+        condition,
+        detector=ctx.detector,
+        baseline=ctx.baseline,
+        threshold=ctx.threshold,
+        min_window_sec=ctx.min_window_sec,
+        **meta,
+    )
+
+
+def _make_upload_job(ctx: AppState, tmpdir: tempfile.TemporaryDirectory, inp: Path, condition: EvalCondition):
+    """Decode-then-analyze closure for multipart uploads; owns the temp dir."""
+
+    def run() -> dict:
+        try:
+            wav = decode_to_mono16k(inp, Path(tmpdir.name) / "decoded.wav")
+            return _analyze_with_ctx(ctx, wav, condition, input_type="upload")
+        finally:
+            tmpdir.cleanup()
+
+    return run
+
+
+def _make_sample_job(ctx: AppState, sample_id: str, meta: dict, condition: EvalCondition):
+    path = _samples_dir() / meta["path"]
+
+    def run() -> dict:
+        wav, _sr = load_wav_mono(path, target_sr=TARGET_SR)
+        return _analyze_with_ctx(
+            ctx, wav, condition, input_type="sample", sample_id=sample_id, truth=meta["truth"]
+        )
+
+    return run
+
+
+def _make_url_job(ctx: AppState, url: str, condition: EvalCondition):
+    """yt-dlp download-then-analyze closure; the temp dir lives and dies in the worker."""
+
+    def run() -> dict:
+        tmpdir = tempfile.TemporaryDirectory()
+        try:
+            media = download_video_audio(url, Path(tmpdir.name))
+            wav = decode_to_mono16k(media, Path(tmpdir.name) / "decoded.wav")
+            return _analyze_with_ctx(ctx, wav, condition, input_type="url", url=url)
+        finally:
+            tmpdir.cleanup()
+
+    return run
+
+
+def _submit_job(queue: JobQueue, fn, kind: str) -> str:
+    try:
+        return queue.submit(fn, kind=kind)
+    except QueueFullError as exc:
+        raise HTTPException(status_code=429, detail=QUEUE_FULL_DETAIL) from exc
+
+
+async def _wait_for_job(queue: JobQueue, job_id: str) -> None:
+    await asyncio.to_thread(queue.wait, job_id)
+
+
+def _job_result_or_raise(queue: JobQueue, job_id: str) -> dict:
+    """Translate a finished job into a sync-endpoint response or HTTP error."""
+    view = queue.status_view(job_id)
+    if view is None:
+        raise HTTPException(status_code=500, detail="analysis job vanished")
+    if view["status"] == "error":
+        err = view.get("error") or "analysis failed"
+        if view.get("error_type") in {"ClipTooShortError", "ClipInputError"}:
+            raise HTTPException(status_code=400, detail=err)
+        raise HTTPException(status_code=500, detail=err)
+    return view["result"]
+
+
+def _sample_or_404(sample_id: str) -> dict:
+    meta = SAMPLE_CLIPS.get(sample_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail="unknown sample")
+    path = _samples_dir() / meta["path"]
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="sample not available; restore data/cloakbreak_v1",
+        )
+    return meta
+
+
+def _load_facts() -> dict:
+    """Headline numbers pulled from the results files at startup.
+
+    Every key is omitted individually when its file or json path is missing —
+    the endpoint never hardcodes numbers.
+    """
+    out: dict = {}
+    eval_path = ROOT_DIR / "results" / "session2" / "eval_results.json"
+    if eval_path.is_file():
+        try:
+            data = json.loads(eval_path.read_text(encoding="utf-8"))
+        except Exception:
+            data = None
+        if isinstance(data, dict):
+            def eer(slice_name: str, model: str = "cloakbreak"):
+                slice_ = data.get(slice_name)
+                if not isinstance(slice_, dict):
+                    return None
+                block = slice_.get(model)
+                if not isinstance(block, dict):
+                    return None
+                val = block.get("eer_pct")
+                return float(val) if isinstance(val, (int, float)) else None
+
+            headline_cb = eer("clean_real_vs_kokoro_opus_16k", "cloakbreak")
+            if headline_cb is not None:
+                out["headline_cb_eer"] = headline_cb
+            headline_bl = eer("clean_real_vs_kokoro_opus_16k", "baseline")
+            if headline_bl is not None:
+                out["headline_baseline_eer"] = headline_bl
+            noise_10db = eer("test_noise_10db")
+            if noise_10db is not None:
+                out["noise_10db_eer"] = noise_10db
+            short05 = eer("test_short_0.5s")
+            if short05 is not None:
+                out["short_eer_0_5"] = short05
+            short08 = eer("test_short_0.8s")
+            if short08 is not None:
+                out["short_eer_0_8"] = short08
+    grid_path = ROOT_DIR / "results" / "live_mic_headset_ab17x_grid.json"
+    if grid_path.is_file():
+        try:
+            grid = json.loads(grid_path.read_text(encoding="utf-8"))
+        except Exception:
+            grid = None
+        summary = grid.get("summary") if isinstance(grid, dict) else None
+        if isinstance(summary, dict):
+            frac_all = summary.get("frac_ge_threshold")
+            if isinstance(frac_all, (int, float)):
+                out["livemic_frac_all"] = float(frac_all)
+            frac_gated = summary.get("gate_frac_ge_threshold")
+            if isinstance(frac_gated, (int, float)):
+                out["livemic_frac_gated"] = float(frac_gated)
+    return out
+
+
+def _honest_limits_markdown() -> Optional[str]:
+    """Raw README.md '## Honest Limits' section up to the next '## ' heading."""
+    readme = ROOT_DIR / "README.md"
+    if not readme.is_file():
+        return None
+    try:
+        lines = readme.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    start = None
+    for i, line in enumerate(lines):
+        if line.startswith("## Honest Limits"):
+            start = i
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        if lines[j].startswith("## "):
+            end = j
+            break
+    section = "\n".join(lines[start:end]).strip()
+    return section or None
+
+
+def _web_dist_dir() -> Path:
+    raw = os.getenv("CLOAKBREAK_WEB_DIST", "").strip()
+    return Path(raw) if raw else ROOT_DIR / "web" / "dist"
 
 
 def create_app(state: AppState | None = None) -> FastAPI:
     app = FastAPI(title="CloakBreak", version="0.1.0")
     app.state.ctx = state or AppState()
+    app.state.job_queue = JobQueue()
+    app.state.facts = _load_facts()
 
-    @app.get("/")
-    def index() -> FileResponse:
-        if not FRONTEND_HTML.exists():
-            raise HTTPException(status_code=404, detail="Frontend not found")
-        return FileResponse(FRONTEND_HTML)
+    cors_origin = os.getenv("CLOAKBREAK_CORS_ORIGIN", "").strip()
+    if cors_origin:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[cors_origin],
+            allow_methods=["GET", "POST"],
+            allow_headers=["*"],
+        )
+
+    web_dist = _web_dist_dir()
+    serve_static_spa = web_dist.is_dir()
+
+    if not serve_static_spa:
+        # Legacy single-file frontend, exactly as before the React rebuild:
+        # keeps serving until web/dist exists (phase B ships the real UI).
+        @app.get("/")
+        def index() -> FileResponse:
+            if not FRONTEND_HTML.exists():
+                raise HTTPException(status_code=404, detail="Frontend not found")
+            return FileResponse(FRONTEND_HTML)
 
     @app.get("/api/health")
     def health() -> JSONResponse:
@@ -249,8 +492,80 @@ def create_app(state: AppState | None = None) -> FastAPI:
         file: UploadFile = File(...),
         condition: EvalCondition = Form("clean"),
     ) -> JSONResponse:
+        """Synchronous compatibility endpoint: same FIFO worker, same all-window
+        result shape as the async upload job — the response just waits for it."""
         ctx: AppState = app.state.ctx
-        return JSONResponse(_score_upload(ctx, await file.read(), condition))
+        queue: JobQueue = app.state.job_queue
+        cond = _validate_condition(condition)
+        tmpdir, inp = await _stage_upload(file, enforce_ext=False)
+        try:
+            job_id = _submit_job(queue, _make_upload_job(ctx, tmpdir, inp, cond), kind="upload")
+        except HTTPException:
+            tmpdir.cleanup()
+            raise
+        await _wait_for_job(queue, job_id)
+        return JSONResponse(_job_result_or_raise(queue, job_id))
+
+    @app.post("/api/analyze/upload", status_code=202)
+    async def analyze_upload(
+        file: UploadFile = File(...),
+        condition: str = Form("clean"),
+    ) -> JSONResponse:
+        ctx: AppState = app.state.ctx
+        queue: JobQueue = app.state.job_queue
+        cond = _validate_condition(condition)
+        tmpdir, inp = await _stage_upload(file)
+        try:
+            job_id = _submit_job(queue, _make_upload_job(ctx, tmpdir, inp, cond), kind="upload")
+        except HTTPException:
+            tmpdir.cleanup()
+            raise
+        return JSONResponse({"job_id": job_id}, status_code=202)
+
+    @app.post("/api/analyze/sample/{sample_id}", status_code=202)
+    async def analyze_sample(sample_id: str, request: Request) -> JSONResponse:
+        ctx: AppState = app.state.ctx
+        queue: JobQueue = app.state.job_queue
+        meta = _sample_or_404(sample_id)
+        payload = await _read_payload(request)
+        cond = _validate_condition(payload.get("condition"))
+        job_id = _submit_job(queue, _make_sample_job(ctx, sample_id, meta, cond), kind="sample")
+        return JSONResponse({"job_id": job_id}, status_code=202)
+
+    @app.post("/api/analyze-url", status_code=202)
+    async def analyze_url(request: Request) -> JSONResponse:
+        ctx: AppState = app.state.ctx
+        queue: JobQueue = app.state.job_queue
+        payload = await _read_payload(request)
+        url = payload.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise HTTPException(status_code=422, detail="url is required")
+        url = url.strip()
+        cond = _validate_condition(payload.get("condition"))
+        ssrf_err = await asyncio.to_thread(url_validation_error, url)
+        if ssrf_err is not None:
+            raise HTTPException(status_code=422, detail=ssrf_err)
+        job_id = _submit_job(queue, _make_url_job(ctx, url, cond), kind="url")
+        return JSONResponse({"job_id": job_id}, status_code=202)
+
+    @app.get("/api/jobs/{job_id}")
+    def job_status(job_id: str) -> JSONResponse:
+        queue: JobQueue = app.state.job_queue
+        view = queue.status_view(job_id)
+        if view is None:
+            raise HTTPException(status_code=404, detail="unknown job")
+        return JSONResponse(view)
+
+    @app.get("/api/facts")
+    def facts() -> JSONResponse:
+        return JSONResponse(app.state.facts)
+
+    @app.get("/api/honest-limits")
+    def honest_limits() -> JSONResponse:
+        section = _honest_limits_markdown()
+        if section is None:
+            raise HTTPException(status_code=404, detail="could not parse the Honest Limits section")
+        return JSONResponse({"markdown": section})
 
     @app.get("/api/samples")
     def list_samples() -> JSONResponse:
@@ -279,20 +594,15 @@ def create_app(state: AppState | None = None) -> FastAPI:
         sample_id: str,
         condition: EvalCondition = Form("clean"),
     ) -> JSONResponse:
+        """Synchronous compatibility endpoint: submits the sample analysis to the
+        same FIFO worker as /api/analyze/sample and waits for the result."""
         ctx: AppState = app.state.ctx
-        meta = SAMPLE_CLIPS.get(sample_id)
-        if meta is None:
-            raise HTTPException(status_code=404, detail="unknown sample")
-        path = _samples_dir() / meta["path"]
-        if not path.is_file():
-            raise HTTPException(
-                status_code=404,
-                detail="sample not available; restore data/cloakbreak_v1",
-            )
-        result = _score_upload(ctx, path.read_bytes(), condition)
-        result["sample_id"] = sample_id
-        result["truth"] = meta["truth"]
-        return JSONResponse(result)
+        queue: JobQueue = app.state.job_queue
+        meta = _sample_or_404(sample_id)
+        cond = _validate_condition(condition)
+        job_id = _submit_job(queue, _make_sample_job(ctx, sample_id, meta, cond), kind="sample")
+        await _wait_for_job(queue, job_id)
+        return JSONResponse(_job_result_or_raise(queue, job_id))
 
     @app.get("/api/samples/{sample_id}/audio")
     def sample_audio(sample_id: str) -> FileResponse:
@@ -365,6 +675,23 @@ def create_app(state: AppState | None = None) -> FastAPI:
     async def ws_detect(websocket: WebSocket) -> None:
         await websocket.accept()
         ctx: AppState = app.state.ctx
+
+        # One live mic session at a time — a second concurrent session would
+        # contend with the first for the same CPU-bound detector.
+        with ctx.live_ws_lock:
+            if ctx.live_ws_sessions >= 1:
+                busy = True
+            else:
+                ctx.live_ws_sessions += 1
+                busy = False
+        if busy:
+            await websocket.send_json({
+                "type": "busy",
+                "detail": "Someone else is using the mic. Try again in a moment.",
+            })
+            await websocket.close()
+            return
+
         cond_box = {"condition": "clean"}
 
         def score_fn(window: np.ndarray) -> dict:
@@ -458,6 +785,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
         except WebSocketDisconnect:
             pass
         finally:
+            with ctx.live_ws_lock:
+                ctx.live_ws_sessions = max(0, ctx.live_ws_sessions - 1)
             try:
                 scorer.stop()
                 try:
@@ -483,6 +812,18 @@ def create_app(state: AppState | None = None) -> FastAPI:
                         _write_live_capture(ctx.capture_dir, cap)
                     except Exception as exc:
                         print(f"[ws] debug capture write failed: {exc}", flush=True)
+
+    # Catch-all for unknown API paths, registered after every real API route:
+    # without it an unmatched POST would fall into the static mount below and
+    # surface as a 405 instead of the JSON 404 API clients expect.
+    @app.api_route("/api/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+    def api_not_found(path: str) -> None:
+        raise HTTPException(status_code=404, detail="unknown api endpoint")
+
+    if serve_static_spa:
+        # Mounted LAST so every explicit /api and /ws route wins over it.
+        # html=True serves the React index.html at / (and any directory path).
+        app.mount("/", StaticFiles(directory=str(web_dist), html=True), name="web")
 
     return app
 

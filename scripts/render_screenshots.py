@@ -1,60 +1,42 @@
-"""Render CloakBreak UI screenshots with Playwright.
+"""Render real CloakBreak React-UI screenshots with Playwright.
 
-Playwright is NOT a project dependency — run it through uv (the pinned
-playwright 1.65.2 drives chromium-1255, already in ~/.cache/ms-playwright):
+Playwright is NOT a project dependency — run it through uv:
 
-    uv run --with playwright==1.65.2 python scripts/render_screenshots.py          # REAL mode
-    uv run --with playwright==1.65.2 python scripts/render_screenshots.py --mock    # MOCK mode
+    uv run --with playwright==1.65.2 python scripts/render_screenshots.py
 
-If the browser is missing:  uv run --with playwright==1.65.2 playwright install chromium
+The script starts ``uvicorn app.main:app`` on a random free port with the real
+fp32 ONNX detector and the Hugging Face legacy baseline, drives the production
+React build in headless Chromium, and writes eight real screenshots into
+``docs/screenshots/``:
 
-REAL mode (default) starts ``uvicorn app.main:app`` on a free port with the
-real ONNX detector + Hugging Face baseline
-(CLOAKBREAK_BACKEND=onnx, CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx,
-CLOAKBREAK_BASELINE_ID=Vansh180/deepfake-audio-wav2vec2, ENABLE_CLONE_ENDPOINT=false),
-waits for /api/health, opens the Try samples tab (the default), keeps the
-channel on Clean, clicks each of the six Score buttons in order waiting for
-every result, then captures desktop (1280x900) and mobile (390x844,
-deviceScaleFactor 2) full-page shots into
-``docs/screenshots/real-try-samples-{desktop,mobile}.png``. The six rows'
-displayed score/verdict text plus the health threshold is dumped to
-``results/try_samples_real.json`` and printed. Model loading on a small VM
-takes a while — the health wait is generous.
+    real-{samples-kokoro,samples-librispeech,upload,busy}-{desktop,mobile}.png
 
-MOCK mode (--mock) uses CLOAKBREAK_BACKEND=mock with an intercepted
-/api/health payload and drives ``window.renderResult(...)`` with deterministic
-seeded live-mic payloads, saving ``docs/screenshots/mock-live-clone-desktop.png``
-and ``mock-live-warming-mobile.png``. A visible ribbon reading
-"MOCK — illustrative data, not a measurement" is injected via page script in
-this mode only — the mocked shots must never be mistaken for measurements.
+Desktop is 1440x900; mobile is 390x844 with deviceScaleFactor 2. It also
+rebuilds ``results/try_samples_real.json`` from the values actually displayed
+by the UI for all six Try-samples clips. There is no mock mode.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import math
 import os
-import random
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
-from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OUT_DIR = REPO_ROOT / "docs" / "screenshots"
 RESULTS_DIR = REPO_ROOT / "results"
 VENV_PY = REPO_ROOT / ".venv" / "bin" / "python"
 SERVER_PY = str(VENV_PY) if VENV_PY.exists() else sys.executable
-
-THRESHOLD = 0.95255
-INFERENCE_MS = 633.0
-LAG_MS = 681.0
-LATENCY_MS = 630.0
+MODEL_PATH = REPO_ROOT / "artifacts" / "session2" / "onnx" / "cloakbreak_fp32.onnx"
+BASELINE_ID = "Vansh180/deepfake-audio-wav2vec2"
+FORBIDDEN_PORTS = {8765, 8000, 8088}
 
 SAMPLE_IDS = [
     "kokoro_00483",
@@ -64,21 +46,31 @@ SAMPLE_IDS = [
     "ls_8455-210777-0040",
     "ls_672-122797-0057",
 ]
+KOKORO_SHOT = "kokoro_00483"
+LIBRISPEECH_SHOT = "ls_8463-294828-0031"
 
-MOCK_RIBBON = (
-    "MOCK — illustrative data, not a measurement"
-)
+DESKTOP = {"width": 1440, "height": 900}
+MOBILE = {"width": 390, "height": 844}
+
+OLD_PNGS = [
+    "mock-live-clone-desktop.png",
+    "mock-live-warming-mobile.png",
+    "real-try-samples-desktop.png",
+    "real-try-samples-mobile.png",
+]
 
 
 def _free_port() -> int:
-    sock = socket.socket()
-    sock.bind(("127.0.0.1", 0))
-    port = int(sock.getsockname()[1])
-    sock.close()
-    return port
+    while True:
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = int(sock.getsockname()[1])
+        sock.close()
+        if port not in FORBIDDEN_PORTS:
+            return port
 
 
-def _wait_health(port: int, proc: subprocess.Popen, timeout_s: float = 60.0) -> Dict[str, Any]:
+def _wait_health(port: int, proc: subprocess.Popen, timeout_s: float = 600.0) -> dict[str, Any]:
     url = f"http://127.0.0.1:{port}/api/health"
     deadline = time.monotonic() + timeout_s
     last_err: Any = None
@@ -89,25 +81,36 @@ def _wait_health(port: int, proc: subprocess.Popen, timeout_s: float = 60.0) -> 
             with urllib.request.urlopen(url, timeout=3.0) as resp:
                 if resp.status == 200:
                     return json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001 - keep polling until deadline
+        except Exception as exc:  # keep polling until deadline
             last_err = exc
         time.sleep(0.5)
     raise SystemExit(f"/api/health did not come up within {timeout_s}s (last error: {last_err})")
 
 
-def _start_server(env_extra: Dict[str, str]) -> tuple[subprocess.Popen, int]:
+def _start_server(workdir: Path) -> tuple[subprocess.Popen, int, Path]:
     port = _free_port()
+    log_path = workdir / "uvicorn-screenshots.log"
     env = dict(os.environ)
-    env.update(env_extra)
-    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    env.pop("CLOAKBREAK_WEB_DIST", None)
+    env.update(
+        {
+            "CLOAKBREAK_BACKEND": "onnx",
+            "CLOAKBREAK_MODEL_PATH": str(MODEL_PATH),
+            "CLOAKBREAK_BASELINE_ID": BASELINE_ID,
+            "ENABLE_CLONE_ENDPOINT": "false",
+            "PYTHONPATH": str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", ""),
+        }
+    )
+    log_fh = open(log_path, "w", encoding="utf-8")
     proc = subprocess.Popen(
         [SERVER_PY, "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", str(port)],
         cwd=str(REPO_ROOT),
         env=env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_fh,
+        stderr=subprocess.STDOUT,
     )
-    return proc, port
+    proc._cloakbreak_log_fh = log_fh  # type: ignore[attr-defined] - kept alive with the process
+    return proc, port, log_path
 
 
 def _stop_server(proc: subprocess.Popen) -> None:
@@ -117,153 +120,42 @@ def _stop_server(proc: subprocess.Popen) -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait(timeout=5)
+    log_fh = getattr(proc, "_cloakbreak_log_fh", None)
+    if log_fh is not None:
+        log_fh.close()
 
 
-def _attention_focus(rng: random.Random) -> List[float]:
-    """32 smooth attention bumps, normalized to max 1."""
-    bumps = [(0.22, 0.07, 0.85), (0.55, 0.11, 1.0), (0.82, 0.06, 0.45)]
-    vals = []
-    for i in range(32):
-        x = i / 31.0
-        v = sum(a * math.exp(-((x - c) ** 2) / (2 * w * w)) for c, w, a in bumps)
-        v += rng.uniform(0.0, 0.04)
-        vals.append(v)
-    m = max(vals) or 1.0
-    return [round(v / m, 4) for v in vals]
-
-
-def _seq_payloads(probs: List[float], base_probs: List[float], rng: random.Random) -> List[Dict[str, Any]]:
-    """Build live prediction payloads with server-consistent smoothed verdicts."""
-    hist: deque = deque(maxlen=3)
-    out: List[Dict[str, Any]] = []
-    for i, p in enumerate(probs):
-        hist.append(p)
-        hits = sum(1 for x in hist if x >= THRESHOLD)
-        verdict = "spoof" if hits >= 2 else "bonafide"
-        window_verdict = "spoof" if p >= THRESHOLD else "bonafide"
-        audio_end = round(2.5 + i * 2.1, 3)
-        out.append(
-            {
-                "type": "prediction",
-                "is_speech": True,
-                "spoof_prob": p,
-                "baseline_prob": base_probs[i],
-                "window_verdict": window_verdict,
-                "verdict": verdict,
-                "smoothing": "2_of_3",
-                "recent_scores": [round(float(x), 4) for x in hist],
-                "threshold": THRESHOLD,
-                "audio_start_sec": round(audio_end - 2.5, 3),
-                "audio_end_sec": audio_end,
-                "stream_sec_received": round(audio_end + LAG_MS / 1000.0, 3),
-                "inference_ms": INFERENCE_MS,
-                "lag_ms": LAG_MS,
-                "dropped_windows": i,
-                "attention_focus": _attention_focus(rng),
-                "latency_ms": LATENCY_MS,
-                "backend": "onnx",
-                "condition": "clean",
-                "window_sec": 2.5,
-                "input_dbfs": round(-41.0 - 0.1 * i, 1),
-                "noise_floor_dbfs": round(-54.0 + 0.05 * i, 1),
-                "speech_gate_dbfs": round(-48.0 + 0.05 * i, 1),
-            }
-        )
-    return out
-
-
-def _clone_payloads(rng: random.Random) -> List[Dict[str, Any]]:
-    real_probs = [round(rng.uniform(0.02, 0.30), 4) for _ in range(18)]
-    clone_probs = [round(rng.uniform(0.97, 0.999), 4) for _ in range(12)]
-    base = [round(rng.uniform(0.06, 0.20), 4) for _ in range(30)]
-    return _seq_payloads(real_probs + clone_probs, base, rng)
-
-
-def _warming_payload() -> List[Dict[str, Any]]:
-    return [
-        {
-            "type": "prediction",
-            "warming_up": True,
-            "is_speech": True,
-            "spoof_prob": None,
-            "baseline_prob": None,
-            "window_verdict": None,
-            "verdict": None,
-            "smoothing": "2_of_3",
-            "recent_scores": [],
-            "threshold": THRESHOLD,
-            "audio_start_sec": 0.0,
-            "audio_end_sec": 1.2,
-            "stream_sec_received": 1.2,
-            "inference_ms": 0.0,
-            "lag_ms": 0.0,
-            "dropped_windows": 0,
-            "attention_focus": [0.0] * 32,
-            "latency_ms": 0.0,
-            "backend": "onnx",
-            "condition": "clean",
-            "window_sec": 1.2,
-            "input_dbfs": -46.5,
-            "noise_floor_dbfs": -54.0,
-            "speech_gate_dbfs": -48.0,
-        }
-    ]
-
-
-MOCK_HEALTH = {
-    "status": "ok",
-    "backend": "onnx:cloakbreak_fp32.onnx",
-    "baseline_loaded": True,
-    "baseline_id": "Vansh180/deepfake-audio-wav2vec2",
-    "clone_enabled": False,
-    "threshold": THRESHOLD,
-    "threshold_source": "file",
-    "debug_capture": False,
-    "samples_available": 6,
-}
-
-
-def _inject_mock_ribbon(page) -> None:
-    page.evaluate(
-        """(text) => {
-            const d = document.createElement('div');
-            d.id = 'mockRibbon';
-            d.textContent = text;
-            d.style.cssText = 'position:fixed;left:0;right:0;bottom:0;z-index:9999;'
-                + 'background:#7f1d1d;color:#fee2e2;text-align:center;'
-                + 'font:600 13px system-ui,sans-serif;padding:8px 12px;'
-                + 'letter-spacing:0.02em;';
-            document.body.appendChild(d);
-        }""",
-        MOCK_RIBBON,
-    )
-
-
-# Every descendant of .sample-row / .card must stay inside its container box
+# Every descendant of a UI container must stay inside that container's box
 # (1 px tolerance for fractional layout). Zero-size rects are skipped so
-# display:none subtrees (hidden panels, clone panel) don't false-positive.
+# hidden tab panels do not false-positive.
 OVERFLOW_JS = """() => {
   const bad = [];
   const fmt = (el) => {
     const cls = typeof el.className === 'string' && el.className.trim()
       ? '.' + el.className.trim().split(/\\s+/).join('.')
       : '';
-    return el.tagName.toLowerCase() + cls;
+    const tid = el.getAttribute && el.getAttribute('data-testid');
+    return el.tagName.toLowerCase() + (tid ? '[data-testid=' + tid + ']' : cls);
   };
-  document.querySelectorAll('.sample-row, .card').forEach((box) => {
+  const boxes = document.querySelectorAll(
+    '[data-testid=input-card], [data-testid=verdict-card], [data-testid^=sample-card-], .card'
+  );
+  boxes.forEach((box) => {
     const r = box.getBoundingClientRect();
     if (r.width === 0 || r.height === 0) return;
-    const boxSel = box.id ? '#' + box.id : fmt(box);
     box.querySelectorAll('*').forEach((el) => {
       const er = el.getBoundingClientRect();
       if (er.width === 0 && er.height === 0) return;
       if (er.right > r.right + 1 || er.left < r.left - 1) {
-        bad.push(boxSel + ' > ' + fmt(el)
+        bad.push(fmt(box) + ' > ' + fmt(el)
           + ' right=' + er.right.toFixed(1) + '/' + r.right.toFixed(1)
           + ' left=' + er.left.toFixed(1) + '/' + r.left.toFixed(1));
       }
     });
   });
+  if (document.documentElement.scrollWidth > window.innerWidth + 1) {
+    bad.push('document scrollWidth=' + document.documentElement.scrollWidth + ' innerWidth=' + window.innerWidth);
+  }
   return bad;
 }"""
 
@@ -278,94 +170,238 @@ def _assert_no_overflow(page, label: str) -> None:
     print(f"[shots] overflow check OK — {label}", flush=True)
 
 
+def _wait_contains(page, selector: str, text: str, timeout: float) -> None:
+    page.wait_for_function(
+        """({selector, text}) => {
+            const el = document.querySelector(selector);
+            return el && el.textContent && el.textContent.includes(text);
+        }""",
+        arg={"selector": selector, "text": text},
+        timeout=timeout,
+    )
+
+
+def _capture(page, path: Path, label: str) -> None:
+    page.wait_for_timeout(350)  # let the score-bar width transitions settle
+    _assert_no_overflow(page, label)
+    page.screenshot(path=str(path), full_page=True)
+    print(f"[shots] {path.relative_to(REPO_ROOT)}", flush=True)
+
+
+def _new_page(browser, viewport: dict[str, int], scale: float, base_url: str):
+    ctx = browser.new_context(viewport=viewport, device_scale_factor=scale)
+    page = ctx.new_page()
+    page.goto(base_url, wait_until="load")
+    return ctx, page
+
+
+def _wait_samples(page) -> None:
+    page.wait_for_function(
+        "() => document.querySelectorAll('[data-testid^=sample-card-]').length === 6",
+        timeout=30000,
+    )
+
+
+def _analyze_sample(page, sample_id: str) -> dict[str, Any]:
+    button = page.locator(f'[data-testid="analyze-sample-{sample_id}"]')
+    button.wait_for(state="visible", timeout=15000)
+    page.wait_for_function(
+        "(sid) => !(document.querySelector(`[data-testid=analyze-sample-${sid}]`) || {}).disabled",
+        arg=sample_id,
+        timeout=180000,
+    )
+    button.click()
+    page.locator(f'[data-testid="sample-result-{sample_id}"]').wait_for(state="visible", timeout=180000)
+    page.wait_for_timeout(150)
+    rows = page.evaluate(
+        """() => [...document.querySelectorAll('[data-testid^=window-row-]')]
+            .map((row) => {
+              const idx = Number((row.getAttribute('data-testid') || 'window-row--1').replace('window-row-', ''));
+              return {
+                index: idx,
+                time: (row.children[0] || {}).textContent?.trim() || '',
+                cloakbreak: (row.querySelector('[data-testid=window-cb-' + idx + ']') || {}).textContent?.trim() || '',
+                legacy: (row.querySelector('[data-testid=window-legacy-' + idx + ']') || {}).textContent?.trim() || '',
+                state: (row.children[3] || {}).textContent?.trim() || '',
+              };
+            })
+            .sort((a, b) => a.index - b.index)"""
+    )
+    over_text = page.locator(f'[data-testid="sample-over-{sample_id}"]').inner_text().strip()
+    n_over, n_speech = [int(part) for part in over_text.split("/", 1)]
+    return {
+        "id": sample_id,
+        "overall_verdict": page.locator(f'[data-testid="sample-verdict-{sample_id}"]').inner_text().strip(),
+        "max_window_score": page.locator(f'[data-testid="sample-max-{sample_id}"]').inner_text().strip(),
+        "windows_over_threshold": over_text,
+        "n_over_threshold": n_over,
+        "n_speech": n_speech,
+        "truth_label": page.locator(f'[data-testid="truth-pill-{sample_id}"]').inner_text().strip(),
+        "windows": rows,
+    }
+
+
+def _show_sample_result(page, sample_id: str, label_fragment: str) -> None:
+    page.locator(f'[data-testid="show-result-{sample_id}"]').click()
+    _wait_contains(page, '[data-testid="timeline-meta"]', label_fragment, 15000)
+
+
+def _select_upload_file(page, path: Path) -> None:
+    page.locator('[data-testid="upload-file-input"]').set_input_files(str(path))
+    _wait_contains(page, '[data-testid="selected-file-name"]', path.name, 10000)
+
+
+def _open_upload_tab(page) -> None:
+    page.locator('[data-testid="tab-upload"]').click()
+    page.locator('[data-testid="upload-file-input"]').wait_for(state="visible", timeout=10000)
+
+
+def _make_media(workdir: Path) -> tuple[Path, Path]:
+    """Return (upload_mp3, slow_50s_wav), both through real ffmpeg encode paths."""
+    src = REPO_ROOT / "data" / "cloakbreak_v1" / "kokoro_unseen" / "kokoro_00069.wav"
+    if not src.is_file():
+        raise SystemExit(f"missing media source {src}")
+    mp3 = workdir / "kokoro_00069_upload.mp3"
+    conv = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-i", str(src), "-codec:a", "libmp3lame", "-q:a", "4", str(mp3)],
+        capture_output=True,
+        text=True,
+    )
+    if conv.returncode != 0:
+        raise SystemExit(f"ffmpeg mp3 encode failed: {conv.stderr}")
+
+    concat_list = workdir / "concat.txt"
+    concat_list.write_text("".join(f"file '{src}'\n" for _ in range(9)), encoding="utf-8")  # ~53 s
+    slow = workdir / "slow_50s.wav"
+    conv = subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(concat_list),
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(slow),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if conv.returncode != 0:
+        raise SystemExit(f"ffmpeg slow-wav concat failed: {conv.stderr}")
+    return mp3, slow
+
+
+def _samples_desktop(page, browser, base_url: str) -> list[dict[str, Any]]:
+    _wait_samples(page)
+    entries = []
+    for sample_id in SAMPLE_IDS:
+        print(f"[shots] analyzing sample {sample_id} (desktop results capture)", flush=True)
+        entries.append(_analyze_sample(page, sample_id))
+
+    _show_sample_result(page, KOKORO_SHOT, "Kokoro clip 00483")
+    _capture(page, OUT_DIR / "real-samples-kokoro-desktop.png", "real-samples-kokoro-desktop")
+    _show_sample_result(page, LIBRISPEECH_SHOT, "LibriSpeech 8463-294828-0031")
+    _capture(page, OUT_DIR / "real-samples-librispeech-desktop.png", "real-samples-librispeech-desktop")
+    return entries
+
+
+def _samples_mobile(browser, base_url: str) -> None:
+    ctx, page = _new_page(browser, MOBILE, 2, base_url)
+    try:
+        _wait_samples(page)
+        print("[shots] analyzing kokoro sample (mobile)", flush=True)
+        _analyze_sample(page, KOKORO_SHOT)
+        _capture(page, OUT_DIR / "real-samples-kokoro-mobile.png", "real-samples-kokoro-mobile")
+        print("[shots] analyzing LibriSpeech sample (mobile)", flush=True)
+        _analyze_sample(page, LIBRISPEECH_SHOT)
+        _capture(page, OUT_DIR / "real-samples-librispeech-mobile.png", "real-samples-librispeech-mobile")
+    finally:
+        ctx.close()
+
+
+def _upload_scenario(browser, base_url: str, upload_mp3: Path, viewport: dict[str, int], scale: float, suffix: str) -> None:
+    ctx, page = _new_page(browser, viewport, scale, base_url)
+    try:
+        _open_upload_tab(page)
+        _select_upload_file(page, upload_mp3)
+        page.locator('[data-testid="analyze-upload-button"]').click()
+        page.locator('[data-testid="timeline-meta"]').wait_for(state="visible", timeout=180000)
+        _wait_contains(page, '[data-testid="timeline-meta"]', upload_mp3.name, 15000)
+        _capture(page, OUT_DIR / f"real-upload-{suffix}.png", f"real-upload-{suffix}")
+    finally:
+        ctx.close()
+
+
+def _busy_scenario(browser, base_url: str, slow_wav: Path, upload_mp3: Path, viewport: dict[str, int], scale: float, suffix: str) -> None:
+    ctx = browser.new_context(viewport=viewport, device_scale_factor=scale)
+    try:
+        first = ctx.new_page()
+        first.goto(base_url, wait_until="load")
+        _open_upload_tab(first)
+        _select_upload_file(first, slow_wav)
+        first.locator('[data-testid="analyze-upload-button"]').click()
+        _wait_contains(first, '[data-testid="job-status"]', "Analysis is running.", 30000)
+
+        second = ctx.new_page()
+        second.goto(base_url, wait_until="load")
+        _open_upload_tab(second)
+        _select_upload_file(second, upload_mp3)
+        second.locator('[data-testid="analyze-upload-button"]').click()
+        _wait_contains(
+            second,
+            '[data-testid="job-status"]',
+            "Someone else is being analyzed. You're #1 in line.",
+            30000,
+        )
+        _capture(second, OUT_DIR / f"real-busy-{suffix}.png", f"real-busy-{suffix}")
+
+        # Leave the queue empty for the next viewport/scenario: the first job
+        # analyzes twenty windows, then the second job runs behind it.
+        second.locator('[data-testid="timeline-meta"]').wait_for(state="visible", timeout=240000)
+    finally:
+        ctx.close()
+
+
 def real_mode() -> None:
-    """Score all six allowlisted samples with the real models; screenshot."""
     from playwright.sync_api import sync_playwright
+
+    if not MODEL_PATH.is_file():
+        raise SystemExit(f"missing ONNX model: {MODEL_PATH}")
+    if not (REPO_ROOT / "web" / "dist" / "index.html").is_file():
+        raise SystemExit("web/dist/index.html is missing — run: cd web && npm ci && npm run build")
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    proc, port = _start_server(
-        {
-            "CLOAKBREAK_BACKEND": "onnx",
-            "CLOAKBREAK_MODEL_PATH": "artifacts/session2/onnx/cloakbreak_fp32.onnx",
-            "CLOAKBREAK_BASELINE_ID": "Vansh180/deepfake-audio-wav2vec2",
-            "ENABLE_CLONE_ENDPOINT": "false",
-        }
-    )
+    for name in OLD_PNGS:
+        old = OUT_DIR / name
+        if old.exists():
+            old.unlink()
+            print(f"[shots] removed stale {name}", flush=True)
+
+    workdir = Path(tempfile.mkdtemp(prefix="cb_screenshots_"))
+    upload_mp3, slow_wav = _make_media(workdir)
+    print(f"[shots] media: {upload_mp3.name} ({upload_mp3.stat().st_size} bytes), {slow_wav.name} ({slow_wav.stat().st_size} bytes)", flush=True)
+
+    proc, port, log_path = _start_server(workdir)
     try:
         health = _wait_health(port, proc, timeout_s=600.0)
-        print(f"[shots:real] uvicorn up on :{port}; health={json.dumps(health)[:200]}", flush=True)
+        print(f"[shots] uvicorn up on :{port}; backend={health.get('backend')} threshold={health.get('threshold')}", flush=True)
+        if health.get("baseline_loaded") is not True:
+            raise SystemExit(f"legacy baseline did not load; see {log_path}")
         base_url = f"http://127.0.0.1:{port}/"
-
-        def score_all(page) -> List[Dict[str, str]]:
-            """Click every Score button in order; return the displayed row text."""
-            rows = page.evaluate(
-                """() => [...document.querySelectorAll('.sample-row')].map(r => ({
-                    id: r.dataset.id,
-                    name: r.querySelector('.sample-name').textContent,
-                    truth: (r.querySelector('.sample-sub .truth') || {}).textContent || '',
-                    cb: (r.querySelector('.res-val.cb') || {}).textContent || '',
-                    legacy: (r.querySelector('.res-val.bl') || {}).textContent || '',
-                }))"""
-            )
-            assert len(rows) == len(SAMPLE_IDS), f"expected {len(SAMPLE_IDS)} rows, got {len(rows)}"
-            for i, sid in enumerate(SAMPLE_IDS):
-                assert rows[i]["id"] == sid, f"row {i} id {rows[i]['id']} != {sid}"
-                page.click(f".sample-row[data-id='{sid}'] .score-btn")
-                page.wait_for_function(
-                    """(sid) => {
-                        const r = document.querySelector(`.sample-row[data-id='${sid}']`);
-                        const el = r && r.querySelector('.res-val.cb');
-                        return el && /\\d+\\.\\d{3}/.test(el.textContent);
-                    }""",
-                    arg=sid,
-                    timeout=180000,
-                )
-                page.wait_for_timeout(150)
-            return page.evaluate(
-                """() => [...document.querySelectorAll('.sample-row')].map(r => ({
-                    id: r.dataset.id,
-                    name: r.querySelector('.sample-name').textContent,
-                    truth: (r.querySelector('.sample-sub .truth') || {}).textContent || '',
-                    cb: (r.querySelector('.res-val.cb') || {}).textContent || '',
-                    legacy: (r.querySelector('.res-val.bl') || {}).textContent || '',
-                }))"""
-            )
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             try:
-                # Desktop pass: score all six, capture, dump row text.
-                ctx = browser.new_context(viewport={"width": 1280, "height": 900}, device_scale_factor=1)
-                page = ctx.new_page()
-                page.goto(base_url, wait_until="load")
-                page.wait_for_function(
-                    "() => document.querySelectorAll('.sample-row').length === 6",
-                    timeout=30000,
-                )
-                page.select_option("#conditionSel", "clean")
-                rows_desktop = score_all(page)
-                page.wait_for_timeout(300)
-                _assert_no_overflow(page, "real-try-samples-desktop")
-                page.screenshot(path=str(OUT_DIR / "real-try-samples-desktop.png"), full_page=True)
-                print("[shots:real] docs/screenshots/real-try-samples-desktop.png", flush=True)
-                ctx.close()
+                # Desktop samples pass: all six analyses are also the data source
+                # for results/try_samples_real.json.
+                ctx, page = _new_page(browser, DESKTOP, 1, base_url)
+                try:
+                    entries = _samples_desktop(page, browser, base_url)
+                finally:
+                    ctx.close()
 
-                # Mobile pass (fresh page, rescore — same deterministic results).
-                ctx = browser.new_context(viewport={"width": 390, "height": 844}, device_scale_factor=2)
-                page = ctx.new_page()
-                page.goto(base_url, wait_until="load")
-                page.wait_for_function(
-                    "() => document.querySelectorAll('.sample-row').length === 6",
-                    timeout=30000,
-                )
-                page.select_option("#conditionSel", "clean")
-                rows_mobile = score_all(page)
-                page.wait_for_timeout(300)
-                _assert_no_overflow(page, "real-try-samples-mobile")
-                page.screenshot(path=str(OUT_DIR / "real-try-samples-mobile.png"), full_page=True)
-                print("[shots:real] docs/screenshots/real-try-samples-mobile.png", flush=True)
-                ctx.close()
+                _samples_mobile(browser, base_url)
+                _upload_scenario(browser, base_url, upload_mp3, DESKTOP, 1, "desktop")
+                _upload_scenario(browser, base_url, upload_mp3, MOBILE, 2, "mobile")
+                _busy_scenario(browser, base_url, slow_wav, upload_mp3, DESKTOP, 1, "desktop")
+                _busy_scenario(browser, base_url, slow_wav, upload_mp3, MOBILE, 2, "mobile")
             finally:
                 browser.close()
 
@@ -373,90 +409,20 @@ def real_mode() -> None:
             "threshold": health.get("threshold"),
             "backend": health.get("backend"),
             "baseline_id": health.get("baseline_id"),
-            "rows_desktop": rows_desktop,
-            "rows_mobile": rows_mobile,
+            "condition": "clean",
+            "source": "Values captured from the rendered React UI by scripts/render_screenshots.py",
+            "samples": entries,
         }
         out_json = RESULTS_DIR / "try_samples_real.json"
         out_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print(f"[shots:real] wrote {out_json.relative_to(REPO_ROOT)}")
-        print(json.dumps(report, indent=2))
+        print(f"[shots] wrote {out_json.relative_to(REPO_ROOT)}", flush=True)
+        print(json.dumps(report, indent=2), flush=True)
     finally:
         _stop_server(proc)
-
-
-def mock_mode() -> None:
-    """Mock backend + intercepted health; deterministic live-mic states."""
-    from playwright.sync_api import sync_playwright
-
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    rng = random.Random(42)
-    states = {
-        "clone": _clone_payloads(rng),
-        "warming": _warming_payload(),
-    }
-
-    proc, port = _start_server({"CLOAKBREAK_BACKEND": "mock", "ENABLE_CLONE_ENDPOINT": "false"})
-    try:
-        _wait_health(port, proc, timeout_s=60.0)
-        print(f"[shots:mock] uvicorn up on :{port}")
-        base_url = f"http://127.0.0.1:{port}/"
-
-        def health_route(route) -> None:
-            route.fulfill(status=200, content_type="application/json", body=json.dumps(MOCK_HEALTH))
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            try:
-                shots = (
-                    ("clone", "desktop", {"width": 1280, "height": 900}, 1, "mock-live-clone-desktop.png"),
-                    ("warming", "mobile", {"width": 390, "height": 844}, 2, "mock-live-warming-mobile.png"),
-                )
-                for state_name, vp_name, viewport, dsf, fname in shots:
-                    ctx = browser.new_context(viewport=viewport, device_scale_factor=dsf)
-                    ctx.route("**/api/health", health_route)
-                    page = ctx.new_page()
-                    page.goto(base_url, wait_until="load")
-                    page.wait_for_function(
-                        "() => !document.getElementById('backendBadge')"
-                        ".textContent.includes('connecting')",
-                        timeout=15000,
-                    )
-                    page.click("#tab-live")  # live-mic state -> show the live panel
-                    page.evaluate(
-                        "ps => { for (const p of ps) window.renderResult(p); }",
-                        states[state_name],
-                    )
-                    page.wait_for_timeout(300)
-                    _inject_mock_ribbon(page)
-                    page.wait_for_timeout(100)
-                    _assert_no_overflow(page, f"mock-live-{state_name}-{vp_name}")
-                    out = OUT_DIR / fname
-                    page.screenshot(path=str(out), full_page=True)
-                    print(f"[shots:mock] {out.relative_to(REPO_ROOT)}")
-                    ctx.close()
-            finally:
-                browser.close()
-    finally:
-        _stop_server(proc)
-
-
-def _clear_old_pngs() -> None:
-    """Remove screenshots from the previous (dark, mocked) naming scheme."""
-    for old in OUT_DIR.glob("*.png"):
-        if old.name.startswith(("desktop-", "mobile-")):
-            old.unlink()
-            print(f"[shots] removed stale {old.name}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mock", action="store_true", help="mock backend + illustrative payloads")
-    args = parser.parse_args()
-    _clear_old_pngs()
-    if args.mock:
-        mock_mode()
-    else:
-        real_mode()
+    real_mode()
 
 
 if __name__ == "__main__":

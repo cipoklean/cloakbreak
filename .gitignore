@@ -20,3 +20,5 @@ results/live_capture/
 *.onnx
 *.onnx.data
 .DS_Store
+web/node_modules/
+web/dist/
