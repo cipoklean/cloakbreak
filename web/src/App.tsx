@@ -355,7 +355,7 @@ export default function App() {
 
   const headline = useMemo(() => {
     if (!facts || typeof facts.headline_cb_eer !== "number" || typeof facts.headline_baseline_eer !== "number") return null;
-    return `Unseen Kokoro voices over Opus: ${formatMeasuredNumber(facts.headline_cb_eer)}% error vs ${formatMeasuredNumber(facts.headline_baseline_eer)}% for a legacy detector.`;
+    return `Real speech vs unseen Kokoro clones over Opus 16 kbps: ${formatMeasuredNumber(facts.headline_cb_eer)}% error vs ${formatMeasuredNumber(facts.headline_baseline_eer)}% for a legacy detector.`;
   }, [facts]);
 
   const backendChip = backendReachable === false ? "backend unreachable" : health?.backend ? health.backend : "backend connecting";
@@ -389,7 +389,7 @@ export default function App() {
         <header className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
             <h1 className="text-3xl font-semibold tracking-tight text-slate-950">CloakBreak</h1>
-            <p className="mt-1 text-base text-slate-700">Spots cloned voices, even after WhatsApp-style compression.</p>
+            <p className="mt-1 text-base text-slate-700">Spots cloned voices, even after Opus call compression.</p>
             {headline ? <p className="mt-2 text-sm font-medium text-slate-700">{headline}</p> : null}
           </div>
           <div className="inline-flex w-fit max-w-full items-center rounded-xl border border-[#d5e2f0] bg-white px-3 py-2 font-mono text-xs tabular-nums text-[#0369a1] shadow-sm" data-testid="backend-chip">

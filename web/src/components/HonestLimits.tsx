@@ -146,7 +146,7 @@ export function HonestLimits({ facts }: HonestLimitsProps) {
     chips.push("Clips under 1 s: at chance");
   }
   if (facts && typeof facts.headline_cb_eer === "number") {
-    chips.push("Unseen voice cloners: accuracy drops");
+    chips.push("Only one unseen cloner tested (Kokoro)");
   }
   if (facts && (typeof facts.livemic_frac_all === "number" || typeof facts.livemic_frac_gated === "number")) {
     chips.push("Live mic: false alarms on unfamiliar mics");

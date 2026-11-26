@@ -474,17 +474,22 @@ def test_frontend_demo_page_static() -> None:
         assert tab in src
     assert "Experimental" in src
     for copy in (
+        "Spots cloned voices, even after Opus call compression.",
+        "Real speech vs unseen Kokoro clones over Opus 16 kbps: ",
         "Live mic can false-alarm on voices and mics unlike the training data",
         "of all windows, ",
         "of scored windows on the builder's own headset",
         "Noisy audio: ",
         "Clips under 1 s: at chance",
-        "Unseen voice cloners: accuracy drops",
+        "Only one unseen cloner tested (Kokoro)",
         "Live mic: false alarms on unfamiliar mics",
         "Six test-split clips picked for the demo. Not a benchmark; see the results table in the README.",
-        "Experimental. Trained on speech from a few voice cloners. Music, noise and unseen cloners lower accuracy.",
+        "Experimental. Trained on speech from a few voice cloners. Noise lowers measured accuracy; music and unseen cloners beyond Kokoro are untested.",
     ):
         assert copy in src
+    assert "WhatsApp-style compression" not in src
+    assert "Unseen voice cloners: accuracy drops" not in src
+    assert "unseen cloners lower accuracy" not in src
 
 
 def test_frontend_mic_audio_path_static() -> None:

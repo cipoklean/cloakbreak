@@ -77,7 +77,7 @@ export function UploadLinkPanel({ inFlight, jobProgress, analysisError, onAnalyz
           <span className="rounded-full border border-amber-300 bg-amber-100 px-2.5 py-1 text-xs font-semibold text-amber-800">Experimental</span>
         </div>
         <p className="mt-2 text-sm leading-relaxed text-slate-600">
-          Experimental. Trained on speech from a few voice cloners. Music, noise and unseen cloners lower accuracy.
+          Experimental. Trained on speech from a few voice cloners. Noise lowers measured accuracy; music and unseen cloners beyond Kokoro are untested.
         </p>
         <p className="mt-1 text-sm text-slate-600">Analysis covers at most the first 60 seconds.</p>
       </div>
