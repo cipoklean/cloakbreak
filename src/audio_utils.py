@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+from collections import deque
 from pathlib import Path
 from typing import Tuple
 
@@ -151,6 +152,82 @@ def pad_or_crop(
 
 def rms_vad(waveform: np.ndarray, threshold: float = 0.012) -> bool:
     return audio_rms(waveform) >= threshold
+
+
+def rms_dbfs(waveform: np.ndarray) -> float:
+    """Window RMS in dBFS, floored at -120 (digital silence)."""
+    rms = audio_rms(waveform)
+    if rms <= 0.0:
+        return -120.0
+    return float(max(-120.0, 20.0 * np.log10(rms)))
+
+
+# Blocks louder than this are treated as signal, not noise floor: real mic
+# noise floors sit below -40 dBFS, and without the ceiling continuous loud
+# speech would raise its own 10th-percentile "floor" above the gate and reject
+# itself.
+_FLOOR_BLOCK_MAX_DBFS = -30.0
+_FLOOR_BLOCK_MIN_DBFS = -90.0  # digital silence never enters the floor
+
+
+class SpeechGate:
+    """Noise-floor-relative speech gate for live microphone streams.
+
+    Quiet headset mics deliver speech near -40 dBFS, so a fixed RMS threshold
+    either rejects real speech or accepts the noise floor. This gate tracks the
+    rolling 10th-percentile block level (the noise floor) and opens the gate
+    ``margin_db`` above it, clamped to ``[min_gate_dbfs, ...]``; with too little
+    history it falls back to ``fallback_gate_dbfs``.
+    """
+
+    def __init__(
+        self,
+        sr: int = TARGET_SR,
+        block_sec: float = 0.25,
+        history_sec: float = 10.0,
+        percentile: float = 10.0,
+        margin_db: float = 6.0,
+        min_gate_dbfs: float = -60.0,
+        fallback_gate_dbfs: float = -50.0,
+        min_history_blocks: int = 4,
+    ) -> None:
+        self.sr = int(sr)
+        self.block_samples = max(1, int(round(block_sec * self.sr)))
+        self.percentile = float(percentile)
+        self.margin_db = float(margin_db)
+        self.min_gate_dbfs = float(min_gate_dbfs)
+        self.fallback_gate_dbfs = float(fallback_gate_dbfs)
+        self.min_history_blocks = int(min_history_blocks)
+        self._history = deque(maxlen=max(1, int(round(history_sec / block_sec))))
+        self._carry = np.zeros(0, dtype=np.float32)
+
+    def push(self, chunk: np.ndarray) -> None:
+        """Feed one incoming chunk; accumulates into 0.25 s blocks across pushes."""
+        x = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if x.size == 0:
+            return
+        data = np.concatenate([self._carry, x]) if self._carry.size else x
+        n_full = data.size // self.block_samples
+        for i in range(n_full):
+            blk = data[i * self.block_samples : (i + 1) * self.block_samples]
+            db = rms_dbfs(blk)
+            if _FLOOR_BLOCK_MIN_DBFS < db < _FLOOR_BLOCK_MAX_DBFS:
+                self._history.append(db)
+        self._carry = data[n_full * self.block_samples :]
+
+    def noise_floor_dbfs(self) -> float | None:
+        if len(self._history) < self.min_history_blocks:
+            return None
+        return float(np.percentile(np.fromiter(self._history, dtype=np.float64), self.percentile))
+
+    def gate_dbfs(self) -> float:
+        floor = self.noise_floor_dbfs()
+        if floor is None:
+            return self.fallback_gate_dbfs
+        return max(self.min_gate_dbfs, floor + self.margin_db)
+
+    def is_speech(self, window: np.ndarray) -> bool:
+        return rms_dbfs(window) >= self.gate_dbfs()
 
 
 class RollingAudioBuffer:

@@ -53,11 +53,20 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
 
 ## Try It in 5 Minutes
 
-The demo UI in a mocked "clone detected" state (desktop):
+The running app after scoring the six Try samples clips (fp32 ONNX on the Oracle ARM VM, Clean channel, legacy detector loaded):
 
-![CloakBreak demo UI showing a mocked LIKELY CLONE verdict](docs/screenshots/desktop-clone.png)
+![CloakBreak Try samples tab with real scores: three Kokoro clones flagged by CloakBreak and missed by the legacy detector, three LibriSpeech clips scored real by both](docs/screenshots/real-try-samples-desktop.png)
 
-*Mocked UI states rendered by `scripts/render_screenshots.py` from deterministic payloads — not measurements. Other states: [real voice](docs/screenshots/desktop-real.png), [warming up](docs/screenshots/desktop-warming.png), [mobile real](docs/screenshots/mobile-real.png), [mobile clone](docs/screenshots/mobile-clone.png), [mobile warming](docs/screenshots/mobile-warming.png).*
+*Real screenshot with real scores, rendered by `scripts/render_screenshots.py`; the displayed values are saved in [`results/try_samples_real.json`](results/try_samples_real.json). The six clips are test-split files picked for the demo, not a benchmark. Also: [mobile](docs/screenshots/real-try-samples-mobile.png). Live-mic states are mocked and carry a MOCK ribbon in the image: [clone](docs/screenshots/mock-live-clone-desktop.png), [warming up](docs/screenshots/mock-live-warming-mobile.png).*
+
+| Try samples clip | Ground truth | CloakBreak (threshold 0.9526) | Legacy detector (cutoff 0.5) |
+| :--- | :--- | :---: | :---: |
+| kokoro_00483 | Clone (Kokoro, unseen TTS) | 1.000 Clone | 0.084 Real |
+| kokoro_00069 | Clone (Kokoro, unseen TTS) | 0.995 Clone | 0.076 Real |
+| kokoro_00454 | Clone (Kokoro, unseen TTS) | 0.987 Clone | 0.066 Real |
+| LibriSpeech 8463-294828-0031 | Real | 0.000 Real | 0.084 Real |
+| LibriSpeech 8455-210777-0040 | Real | 0.007 Real | 0.110 Real |
+| LibriSpeech 672-122797-0057 | Real | 0.000 Real | 0.237 Real |
 
 1. Clone and install the CPU stack (the tests were run with Python 3.11 and `torch 2.15.0+cpu`):
    ```bash
@@ -74,7 +83,7 @@ The demo UI in a mocked "clone detected" state (desktop):
    ```bash
    CLOAKBREAK_BACKEND=mock .venv/bin/uvicorn app.main:app --port 8000
    ```
-   Open `http://localhost:8000`, allow the microphone, and talk for at least 2 seconds. The UI shows the smoothed FAKE/REAL verdict, the raw score of each window, and how old the scored audio is.
+   Open `http://localhost:8000`. The page has three tabs: **Try samples** (default), **Upload a clip** and **Live mic (experimental)**. In the Live mic tab, allow the microphone and talk for at least 2 seconds; the UI shows the smoothed verdict, the raw score of each window, how old the scored audio is, and your input level against the speech gate.
 4. With the trained model (weights are in the private repo `Cipoklean/cloakbreak-wavlm`; access required):
    ```bash
    .venv/bin/hf download Cipoklean/cloakbreak-wavlm onnx/cloakbreak_fp32.onnx --local-dir artifacts/session2
@@ -82,7 +91,7 @@ The demo UI in a mocked "clone detected" state (desktop):
    CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx \
    .venv/bin/uvicorn app.main:app --port 8000
    ```
-   `/api/health` reports the threshold in use. `results/threshold_calibration.json` is loaded automatically only when its `model_sha256` matches the model file; otherwise the app falls back to 0.5 and reports it.
+   Add `CLOAKBREAK_BASELINE_ID=Vansh180/deepfake-audio-wav2vec2` to show the legacy detector next to CloakBreak. The Try samples tab reads its six clips from `data/cloakbreak_v1/` (restore it first, see [Local Development](#local-development--verification)); clips that are missing show as "not restored". `/api/health` reports the threshold in use. `results/threshold_calibration.json` is loaded automatically only when its `model_sha256` matches the model file; otherwise the app falls back to 0.5 and reports it.
 
 ## Safety, Privacy & Guardrails
 
@@ -92,6 +101,8 @@ The demo UI in a mocked "clone detected" state (desktop):
 4. Kokoro-82M was never used in training. Its prompt sentences are disjoint from the training sentences, and a check fails the run if any sentence overlaps.
 5. The attention view shows where the model focused. It is not proof that a particular stretch of audio is fake.
 6. A verdict is a risk signal, not proof. See Honest Limits before relying on it.
+7. Try samples serves six allowlisted clip IDs only (`GET /api/samples`, `POST /api/samples/{id}/detect`, `GET /api/samples/{id}/audio`); the server never accepts a file path from the client. The clip audio is not in the repository.
+8. Live-mic debug capture (`CLOAKBREAK_DEBUG_CAPTURE=1`) is off by default and writes to `results/live_capture/`, which is gitignored.
 
 ## Engineering Highlights (Verified)
 
@@ -139,7 +150,9 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
 - Browser fallback resampler (48 kHz sweep, compared with `scipy` `resample_poly`): aliasing from 8.5–20 kHz is −96.3 dB vs 0.0 dB for the old every-third-sample decimation, and the speech spectrum matches within 0.11 dB on average from 100 Hz to 7 kHz (`tests/test_resampler_js.py`).
 - Live stream on the same ARM VM (2 min, real time, fp32 ONNX): verdict lag p50 681.3 ms, p95 741.5 ms, max 796.5 ms, with one inference in flight at a time (`results/live_lag_oracle_arm_fp32.json`).
 - fp32 ONNX vs torch checkpoint on the 1,053 val clips: identical AUROC (0.9740) and EER (8.67%), max probability difference 0.0001.
-- 62 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
+- Try samples in the running app (fp32 ONNX on the ARM VM): the three Kokoro clips scored 0.987–1.000 (Clone) while the legacy detector scored them 0.066–0.084 (Real); the three LibriSpeech clips scored 0.000–0.007 (Real). Six hand-picked clips, not a benchmark (`results/try_samples_real.json`).
+- Builder's headset capture (29.8 s, real voice): 12 of 55 windows at or above the threshold (21.8%), see Honest Limits #12 (`results/live_mic_headset_ab17x_grid.json`).
+- 72 CPU tests pass, with transformers 5.2.0 and NumPy 1.26.4 pinned to match the GPU lockfile.
 
 ## Honest Limits
 
@@ -159,26 +172,24 @@ The baseline is [`Vansh180/deepfake-audio-wav2vec2`](https://huggingface.co/Vans
     - 187 windows were dropped as stale.
 
     The FAKE label also needs 2 of the last 3 scored windows at or above the threshold, so after a switch to fake speech it appears at least one extra verdict later. How long that takes end to end was not measured.
-12. **Live microphone false alarms are not solved for every mic.** In the author's own test, a real voice on a laptop mic in Chrome produced window scores between 0.05 and 1.00 and a LIKELY CLONE banner. Two causes in the old browser path are fixed:
-    - **Aliasing:** the page used to decimate to 16 kHz by keeping every Nth sample, which folds 8–24 kHz energy into the band the model hears. It now asks the browser for a 16 kHz `AudioContext` (band-limited resampling). Browsers that refuse that rate fall back to a 7.2 kHz windowed-sinc FIR before resampling.
-    - **Chrome's voice processing:** echo cancellation, noise suppression and auto gain are now requested off. The settings the browser actually applied are shown in the page footer.
+12. **Live mic false-alarms on the builder's own headset: 21.8% of windows.** No retraining was done for this; the model and the 0.9526 threshold are unchanged.
+    - **How it was measured:** a 29.8 s capture of the author's real voice (AB17X USB headset, Brave, voice processing off, `CLOAKBREAK_DEBUG_CAPTURE=1`). The capture was re-scored offline with the app's own scoring path (fp32 ONNX, Clean channel) on every 2.5 s window at a 0.5 s hop, ignoring the speech gate (`scripts/rescore_capture_grid.py`; per-window scores and levels in `results/live_mic_headset_ab17x_grid.json`; the audio itself is not committed).
+    - **Result:** 12 of 55 windows (21.8%) scored at or above 0.9526; median score 0.246. The new speech gate passes 45 of the 55 windows, and all 12 false alarms are among them (26.7% of gated windows). The legacy detector crossed 0.5 on 3 of 55 windows, all of them silent windows the gate skips.
+    - **Why the live app showed nothing during that test:** the headset delivered speech at about −39 to −45 dBFS per window with auto gain off, below the old fixed speech gate (RMS 0.012, about −38.4 dBFS), so all 55 windows were rejected as silence. The gate now tracks the noise floor (10th percentile of 0.25 s block levels over the last 10 s) and opens 6 dB above it, never below −60 dBFS; with too little history it uses −50 dBFS. A fixed −50 dBFS gate was rejected because this headset's silent windows sit at −49 to −52 dBFS. The gate only decides which windows get scored: the scored audio is loudness-normalized to about −23 dBFS RMS before the model sees it, as in training, so input level by itself does not change the score.
+    - **Not tested as a cause:** speech windows were only about 10–15 dB above the headset's noise floor, close to the 10 dB SNR condition where EER is 16.61%, and the headset's frequency response is not in the training data. Either could explain the false alarms; neither was isolated.
+    - **Browser-path fixes from the earlier laptop-mic test still apply:** the page asks for a 16 kHz `AudioContext` (band-limited resampling, with a 7.2 kHz windowed-sinc FIR fallback) and requests echo cancellation, noise suppression and auto gain off, showing the applied settings in the footer. In headless Chrome with real LibriSpeech speech and −35 dBFS out-of-band noise, 4 of 96 windows (4.17%) crossed the threshold vs 3 of 96 on the original audio (`results/live_mic_fakemic_clean_hf35.json`); on 120 clips with −45 dBFS out-of-band noise, the old decimation flagged 8.33% vs 4.17% after the fix (`results/sim_alias_fpr.json`).
 
-    What was measured after the fix (`results/sim_alias_fpr.json`, `results/live_mic_fakemic_clean_hf35.json`):
-    - **Aliasing matters, but it is not the whole story.** On 120 real LibriSpeech test clips upsampled to 48 kHz with 8.5–20 kHz noise at −45 dBFS, the old decimation flagged 8.33% of clips at the 0.9526 threshold; proper resampling flagged 4.17%, the same as with no added noise. At −35 dBFS: 7.50% vs 5.83%.
-    - **Headless Chrome live path:** 2 minutes of real LibriSpeech speech through Chrome's fake microphone (44.1 kHz device, 16 kHz context, voice processing off, −35 dBFS out-of-band noise added). 4 of 96 scored windows (4.17%) were at or above the threshold, and 4 smoothed verdicts were LIKELY CLONE. The same windows of the original 16 kHz audio gave 3 of 96 (3.13%). The scores the server logged matched an offline re-score of the captured audio (mean difference 0.0002).
-    - **Not verified on a real laptop mic.** Real room acoustics, mic frequency response and laptop noise are not in the training data. The fixed page has not been re-tested on the mic that produced the false alarms. Treat live-mic verdicts as unproven until a capture from that mic (see `CLOAKBREAK_DEBUG_CAPTURE` below) shows real speech staying under the threshold.
-
-    At the calibrated threshold, about 5% of real windows are expected to cross it by design (val FPR 4.93%).
+    The page labels Live mic as experimental and shows this result under the verdict. Even on audio like the training data, about 5% of real windows cross the threshold by design (val FPR 4.93%).
 
 ## Repository Structure
 
 ```
 cloakbreak/
-├── app/main.py                 FastAPI app: detect-file, WebSocket stream, private clone endpoint
-├── frontend/index.html         Live demo UI
-├── docs/screenshots/           Mocked demo-state screenshots (render_screenshots.py)
+├── app/main.py                 FastAPI app: detect-file, allowlisted samples, WebSocket stream, private clone endpoint (off)
+├── frontend/index.html         Demo UI (single static file): Try samples, Upload a clip, Live mic
+├── docs/screenshots/           real-* = real app screenshots with real scores; mock-* = labeled MOCK in the image
 ├── src/
-│   ├── audio_utils.py          Loading, loudness normalization, rolling buffer, SNR / rolloff features
+│   ├── audio_utils.py          Loading, loudness normalization, rolling buffer, noise-floor speech gate, SNR / rolloff features
 │   ├── augment.py              Codec, phone, noise, clipping and spectral augmentation; Opus cache
 │   ├── generate_spoofs.py      Session 1 dataset builder (InTheWild, LibriSpeech, Chatterbox, Kokoro)
 │   ├── restore_dataset.py      Session 2 restore: HF snapshot + upstream real clips, verified by manifest
@@ -198,8 +209,9 @@ cloakbreak/
 │   ├── bench_live_lag.py       End-to-end live verdict-lag benchmark (uvicorn + WebSocket client)
 │   ├── bench_live_mic.py       Headless-Chrome fake-mic run of the real browser audio path
 │   ├── replay_capture.py       Re-score a debug capture offline, window by window
+│   ├── rescore_capture_grid.py Re-score a capture on a fixed window grid and replay it through the speech gate
 │   ├── sim_alias_fpr.py        Old vs fixed 48 kHz -> 16 kHz path on real clips
-│   ├── render_screenshots.py   Playwright screenshots of mocked demo states (not measurements)
+│   ├── render_screenshots.py   Playwright screenshots: real Try samples run, or --mock live-mic states
 │   └── hf_auth_check.py        HF token role / namespace check
 ├── results/
 │   ├── threshold_calibration.json   Val-selected threshold + test FPR/TPR (CPU re-run)
@@ -207,6 +219,8 @@ cloakbreak/
 │   ├── latency_oracle_arm_fp32.json
 │   ├── live_lag_oracle_arm_fp32.json
 │   ├── live_mic_fakemic_clean_hf35.json
+│   ├── live_mic_headset_ab17x_grid.json   Builder's headset capture, re-scored per window
+│   ├── try_samples_real.json    Scores the app displayed for the six Try samples clips
 │   ├── sim_alias_fpr.json
 │   └── session2/               Session 2 eval JSON, results table, audits, parity, key lines
 ├── tests/                      CPU test suite
@@ -236,6 +250,13 @@ CLOAKBREAK_MODEL_PATH=artifacts/session2/onnx/cloakbreak_fp32.onnx \
 .venv/bin/uvicorn app.main:app --port 8000      # captures land in results/live_capture/ (gitignored)
 .venv/bin/python -m scripts.replay_capture --wav results/live_capture/<file>.wav \
   --json results/live_capture/<file>.json --model-path artifacts/session2/onnx/cloakbreak_fp32.onnx
+# ...or score every window on a fixed grid (even ones the gate skipped) and see what the gate would pass
+.venv/bin/python -m scripts.rescore_capture_grid --wav results/live_capture/<file>.wav \
+  --baseline-id Vansh180/deepfake-audio-wav2vec2 --out results/<name>.json
+
+# Screenshots (Playwright via uv, not a project dependency): real Try samples run, then mocked live-mic states
+uv run --with playwright==1.65.2 python scripts/render_screenshots.py
+uv run --with playwright==1.65.2 python scripts/render_screenshots.py --mock
 
 # Vast sessions (run inside the tmux session Vast opens on SSH login)
 SMOKE=1 bash scripts/session2_vast.sh   # capped end-to-end check

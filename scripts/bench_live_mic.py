@@ -138,6 +138,7 @@ def _browser_session(port: int, wav48: Path, minutes: float):
                     };
                 }"""
             )
+            page.click("#tab-live")  # mic controls live in the Live mic tab panel
             page.click("#micBtn")
             page.wait_for_function(
                 "() => { const el = document.getElementById('micFooter');"

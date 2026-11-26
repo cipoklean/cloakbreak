@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
+import soundfile as sf
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
 
@@ -40,6 +41,22 @@ FRONTEND_HTML = ROOT_DIR / "frontend" / "index.html"
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB (~15s stereo WAV max)
 CAPTURE_MAX_SECONDS = 30 * 60
 CAPTURE_MAX_SAMPLES = CAPTURE_MAX_SECONDS * TARGET_SR
+
+# Allowlisted demo clips for the "Try samples" tab. IDs only — clients never
+# send paths; each entry maps to a fixed path under the samples dir.
+SAMPLE_CLIPS = {
+    "kokoro_00483": {"path": "kokoro_unseen/kokoro_00483.wav", "truth": "clone", "source": "Kokoro-82M (unseen TTS)"},
+    "kokoro_00069": {"path": "kokoro_unseen/kokoro_00069.wav", "truth": "clone", "source": "Kokoro-82M (unseen TTS)"},
+    "kokoro_00454": {"path": "kokoro_unseen/kokoro_00454.wav", "truth": "clone", "source": "Kokoro-82M (unseen TTS)"},
+    "ls_8463-294828-0031": {"path": "librispeech_clean/test/8463-294828-0031.wav", "truth": "real", "source": "LibriSpeech test-clean (human)"},
+    "ls_8455-210777-0040": {"path": "librispeech_clean/test/8455-210777-0040.wav", "truth": "real", "source": "LibriSpeech test-clean (human)"},
+    "ls_672-122797-0057": {"path": "librispeech_clean/test/672-122797-0057.wav", "truth": "real", "source": "LibriSpeech test-clean (human)"},
+}
+
+
+def _samples_dir() -> Path:
+    raw = os.getenv("CLOAKBREAK_SAMPLES_DIR", "").strip()
+    return Path(raw) if raw else ROOT_DIR / "data" / "cloakbreak_v1"
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -164,6 +181,42 @@ def _write_live_capture(capture_dir: Path, cap: dict) -> Path:
     return wav_path
 
 
+def _score_upload(ctx: AppState, raw: bytes, condition: EvalCondition) -> dict:
+    """Score raw WAV bytes — the shared path behind /api/detect-file and samples."""
+    if len(raw) == 0 or len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="Audio file must be non-empty and <= 5 MB")
+    try:
+        wav, sr = load_wav_bytes_mono(raw, target_sr=TARGET_SR)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid WAV audio: {exc}") from exc
+
+    if wav.shape[0] / float(TARGET_SR) < ctx.min_window_sec:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"need at least {ctx.min_window_sec:.1f} s of audio "
+                "(clips under 1 s are at chance)"
+            ),
+        )
+    if wav.shape[0] > TARGET_SR * 20:
+        wav = wav[: TARGET_SR * 20]
+    degraded = degrade_for_eval(wav, condition=condition, sr=sr)
+    res = ctx.detector.predict(degraded)
+    baseline_prob = ctx.baseline.predict_prob(degraded) if ctx.baseline is not None else None
+    return {
+        "spoof_prob": res.spoof_prob,
+        "baseline_prob": baseline_prob,
+        "attention_focus": res.attention_focus,
+        "latency_ms": res.latency_ms,
+        "backend": res.backend,
+        "condition": condition,
+        "duration_s": round(degraded.shape[0] / float(TARGET_SR), 2),
+        "is_speech": rms_vad(degraded),
+        "threshold": ctx.threshold,
+        "verdict": "spoof" if res.spoof_prob >= ctx.threshold else "bonafide",
+    }
+
+
 def create_app(state: AppState | None = None) -> FastAPI:
     app = FastAPI(title="CloakBreak", version="0.1.0")
     app.state.ctx = state or AppState()
@@ -186,6 +239,9 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "threshold": ctx.threshold,
             "threshold_source": ctx.threshold_source,
             "debug_capture": ctx.debug_capture,
+            "samples_available": sum(
+                1 for meta in SAMPLE_CLIPS.values() if (_samples_dir() / meta["path"]).is_file()
+            ),
         })
 
     @app.post("/api/detect-file")
@@ -194,39 +250,62 @@ def create_app(state: AppState | None = None) -> FastAPI:
         condition: EvalCondition = Form("clean"),
     ) -> JSONResponse:
         ctx: AppState = app.state.ctx
-        raw = await file.read()
-        if len(raw) == 0 or len(raw) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=400, detail="Audio file must be non-empty and <= 5 MB")
-        try:
-            wav, sr = load_wav_bytes_mono(raw, target_sr=TARGET_SR)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"Invalid WAV audio: {exc}") from exc
+        return JSONResponse(_score_upload(ctx, await file.read(), condition))
 
-        if wav.shape[0] / float(TARGET_SR) < ctx.min_window_sec:
+    @app.get("/api/samples")
+    def list_samples() -> JSONResponse:
+        out = []
+        for sample_id, meta in SAMPLE_CLIPS.items():
+            path = _samples_dir() / meta["path"]
+            available = path.is_file()
+            duration_s = None
+            if available:
+                try:
+                    info = sf.info(str(path))
+                    duration_s = round(info.frames / float(info.samplerate), 2)
+                except Exception:
+                    duration_s = None
+            out.append({
+                "id": sample_id,
+                "truth": meta["truth"],
+                "source": meta["source"],
+                "available": available,
+                "duration_s": duration_s,
+            })
+        return JSONResponse(out)
+
+    @app.post("/api/samples/{sample_id}/detect")
+    async def sample_detect(
+        sample_id: str,
+        condition: EvalCondition = Form("clean"),
+    ) -> JSONResponse:
+        ctx: AppState = app.state.ctx
+        meta = SAMPLE_CLIPS.get(sample_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="unknown sample")
+        path = _samples_dir() / meta["path"]
+        if not path.is_file():
             raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"need at least {ctx.min_window_sec:.1f} s of audio "
-                    "(clips under 1 s are at chance)"
-                ),
+                status_code=404,
+                detail="sample not available; restore data/cloakbreak_v1",
             )
-        if wav.shape[0] > TARGET_SR * 20:
-            wav = wav[: TARGET_SR * 20]
-        degraded = degrade_for_eval(wav, condition=condition, sr=sr)
-        res = ctx.detector.predict(degraded)
-        baseline_prob = ctx.baseline.predict_prob(degraded) if ctx.baseline is not None else None
-        return JSONResponse({
-            "spoof_prob": res.spoof_prob,
-            "baseline_prob": baseline_prob,
-            "attention_focus": res.attention_focus,
-            "latency_ms": res.latency_ms,
-            "backend": res.backend,
-            "condition": condition,
-            "duration_s": round(degraded.shape[0] / float(TARGET_SR), 2),
-            "is_speech": rms_vad(degraded),
-            "threshold": ctx.threshold,
-            "verdict": "spoof" if res.spoof_prob >= ctx.threshold else "bonafide",
-        })
+        result = _score_upload(ctx, path.read_bytes(), condition)
+        result["sample_id"] = sample_id
+        result["truth"] = meta["truth"]
+        return JSONResponse(result)
+
+    @app.get("/api/samples/{sample_id}/audio")
+    def sample_audio(sample_id: str) -> FileResponse:
+        meta = SAMPLE_CLIPS.get(sample_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="unknown sample")
+        path = _samples_dir() / meta["path"]
+        if not path.is_file():
+            raise HTTPException(
+                status_code=404,
+                detail="sample not available; restore data/cloakbreak_v1",
+            )
+        return FileResponse(path, media_type="audio/wav")
 
     @app.post("/api/clone")
     async def private_self_clone(
@@ -331,6 +410,7 @@ def create_app(state: AppState | None = None) -> FastAPI:
                         "audio_start_sec": msg.get("audio_start_sec"),
                         "audio_end_sec": msg.get("audio_end_sec"),
                         "spoof_prob": msg.get("spoof_prob"),
+                        "input_dbfs": msg.get("input_dbfs"),
                         "baseline_prob": msg.get("baseline_prob"),
                         "verdict": msg.get("verdict"),
                         "window_verdict": msg.get("window_verdict"),

@@ -6,23 +6,23 @@
   <title>CloakBreak — Live Voice Deepfake Shield</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #0c0e12;
-      --panel: #151922;
-      --panel-2: #0b0d11;
-      --border: #262c3a;
-      --text: #e6e9ef;
-      --muted: #8b95a7;
-      --safe: #22c55e;
-      --warn: #f59e0b;
-      --danger: #ef4444;
-      --accent: #38bdf8;
-      --banner-real-bg: #14532d;
-      --banner-real-fg: #dcfce7;
-      --banner-clone-bg: #7f1d1d;
-      --banner-clone-fg: #fee2e2;
-      --banner-muted-bg: #1f2430;
-      --banner-muted-fg: #cbd5e1;
+      color-scheme: light;
+      --bg: #dceefb;
+      --panel: #ffffff;
+      --panel-2: #f1f5f9;
+      --border: #d5e2f0;
+      --text: #0f172a;
+      --muted: #64748b;
+      --safe: #15803d;
+      --warn: #b45309;
+      --danger: #dc2626;
+      --accent: #0369a1;
+      --banner-real-bg: #dcfce7;
+      --banner-real-fg: #14532d;
+      --banner-clone-bg: #fee2e2;
+      --banner-clone-fg: #7f1d1d;
+      --banner-muted-bg: #e2e8f0;
+      --banner-muted-fg: #334155;
     }
     * { box-sizing: border-box; }
     body {
@@ -41,9 +41,8 @@
       align-items: flex-start;
       flex-wrap: wrap;
       gap: 12px;
-      border-bottom: 1px solid var(--border);
       padding-bottom: 16px;
-      margin-bottom: 20px;
+      margin-bottom: 16px;
     }
     h1 { margin: 0; font-size: 24px; font-weight: 600; letter-spacing: -0.01em; }
     .tagline { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
@@ -59,20 +58,78 @@
       white-space: nowrap;
     }
 
-    .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
-    .ctl-label { font-size: 13px; color: var(--muted); }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+    .chip {
+      display: inline-block;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 4px 12px;
+      font-size: 12.5px;
+      color: #475569;
+    }
+
+    .tabs {
+      display: inline-flex;
+      flex-wrap: wrap;
+      gap: 2px;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 3px;
+      margin-bottom: 16px;
+    }
+    .tab {
+      background: transparent;
+      border: none;
+      border-radius: 8px;
+      padding: 8px 14px;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 14px;
+    }
+    .tab[aria-selected="true"] {
+      background: var(--panel);
+      color: var(--text);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.10);
+    }
+    .tab:hover { color: var(--text); }
+
+    .panel, .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
+    }
+    .panel { margin-bottom: 16px; }
+    .card { display: flex; flex-direction: column; gap: 12px; }
+    .panel-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+    .card-title { margin: 0; font-size: 15px; font-weight: 600; }
+    .tag {
+      font-size: 11.5px;
+      font-weight: 500;
+      color: var(--warn);
+      background: #fef3c7;
+      border: 1px solid #fde68a;
+      border-radius: 999px;
+      padding: 2px 8px;
+    }
+    .note { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+    .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+
     button, select, input[type="file"], input[type="text"], input[type="password"] {
       background: var(--panel);
       color: var(--text);
-      border: 1px solid var(--border);
-      border-radius: 6px;
+      border: 1px solid #c3d0e0;
+      border-radius: 8px;
       padding: 8px 12px;
       font-family: inherit;
       font-size: 14px;
     }
     button { cursor: pointer; font-weight: 500; }
-    button.primary { background: #1d4ed8; border-color: #2563eb; color: #fff; }
-    button.danger { background: #991b1b; border-color: #dc2626; color: #fff; }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+    button.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     select { min-width: 220px; }
     input[type="file"] { padding: 4px 12px; font-size: 13px; max-width: 100%; }
@@ -80,7 +137,7 @@
       background: var(--panel-2);
       color: var(--text);
       border: 1px solid var(--border);
-      border-radius: 5px;
+      border-radius: 6px;
       padding: 4px 8px;
       font: inherit;
       font-size: 12px;
@@ -90,8 +147,11 @@
     input::placeholder { color: var(--muted); }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
+    .channel-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+    .ctl-label { font-size: 13px; color: var(--muted); }
+
     .banner {
-      border-radius: 10px;
+      border-radius: 16px;
       border: 1px solid var(--border);
       padding: 20px 24px;
       margin-bottom: 16px;
@@ -99,8 +159,8 @@
       color: var(--banner-muted-fg);
       transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
     }
-    .banner.real { background: var(--banner-real-bg); color: var(--banner-real-fg); border-color: #166534; }
-    .banner.clone { background: var(--banner-clone-bg); color: var(--banner-clone-fg); border-color: #991b1b; }
+    .banner.real { background: var(--banner-real-bg); color: var(--banner-real-fg); border-color: #86efac; }
+    .banner.clone { background: var(--banner-clone-bg); color: var(--banner-clone-fg); border-color: #fca5a5; }
     .banner-text {
       font-size: clamp(40px, 9vw, 72px);
       font-weight: 600;
@@ -115,18 +175,15 @@
       opacity: 0.85;
       min-height: 1em;
     }
+    .banner-note {
+      margin-top: 10px;
+      padding-top: 10px;
+      border-top: 1px solid rgba(15, 23, 42, 0.12);
+      font-size: 12.5px;
+      opacity: 0.9;
+    }
 
     .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-    .card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-    }
-    .card-title { margin: 0; font-size: 15px; font-weight: 600; }
     .card-verdict { font-size: 15px; font-weight: 500; }
     .score {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -158,7 +215,7 @@
       top: -1px;
       bottom: -1px;
       width: 0;
-      border-left: 2px dashed rgba(230, 233, 239, 0.7);
+      border-left: 2px dashed rgba(15, 23, 42, 0.55);
       transform: translateX(-1px);
       pointer-events: none;
     }
@@ -176,27 +233,61 @@
       display: block;
       background: var(--panel-2);
       border: 1px solid var(--border);
-      border-radius: 6px;
+      border-radius: 8px;
     }
     canvas.spark { height: 96px; }
     canvas.attn { height: 170px; }
     .caption { font-size: 12px; color: var(--muted); }
     .mic-footer {
       margin-top: 16px;
-      min-height: 1.2em;
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       font-variant-numeric: tabular-nums;
       font-size: 12px;
       color: var(--muted);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-height: 1.2em;
     }
     .hidden { display: none; }
     audio { width: 100%; margin-top: 4px; }
 
+    .samples { display: flex; flex-direction: column; gap: 12px; margin-top: 4px; }
+    .sample-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto minmax(0, 240px);
+      gap: 12px;
+      align-items: center;
+      background: var(--panel-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+    }
+    .sample-name { font-weight: 600; font-size: 14px; }
+    .sample-sub { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 4px; font-size: 12px; color: var(--muted); }
+    .truth {
+      border-radius: 999px;
+      padding: 2px 10px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    .truth.clone { background: #fee2e2; color: #7f1d1d; }
+    .truth.real { background: #dcfce7; color: #14532d; }
+    .truth.off { background: #e2e8f0; color: #64748b; }
+    .sample-dur { color: var(--muted); }
+    .sample-audio { width: 100%; max-width: 280px; height: 34px; margin-top: 8px; }
+    .sample-res { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+    .res-cell { display: flex; justify-content: space-between; gap: 10px; white-space: nowrap; }
+    .res-cap { color: var(--muted); }
+    .res-val b { font-weight: 600; }
+
     @media (max-width: 720px) {
       .cards { grid-template-columns: 1fr; }
-      .controls { flex-direction: column; align-items: stretch; }
-      .controls > * { width: 100%; }
+      .channel-row { flex-direction: column; align-items: stretch; }
+      .channel-row > * { width: 100%; }
       select { min-width: 0; width: 100%; }
+      .sample-row { grid-template-columns: minmax(0, 1fr); }
+      .score-btn { width: 100%; }
     }
   </style>
 </head>
@@ -210,21 +301,56 @@
       <div class="badge" id="backendBadge">backend: connecting...</div>
     </header>
 
-    <div class="controls">
-      <button id="micBtn" class="primary">Start Live Mic</button>
+    <div class="chips">
+      <span class="chip">Noise: 16.6% EER at 10 dB SNR</span>
+      <span class="chip">Clips under 1 s: at chance</span>
+      <span class="chip">Live mic: false alarms on unfamiliar mics (21.8% of windows on the builder's headset)</span>
+    </div>
+
+    <div class="tabs" role="tablist" aria-label="Input source">
+      <button class="tab" role="tab" id="tab-live" aria-controls="panel-live" aria-selected="false" tabindex="-1">Live mic (experimental)</button>
+      <button class="tab" role="tab" id="tab-upload" aria-controls="panel-upload" aria-selected="false" tabindex="-1">Upload a clip</button>
+      <button class="tab" role="tab" id="tab-samples" aria-controls="panel-samples" aria-selected="true">Try samples</button>
+    </div>
+
+    <div class="panel" role="tabpanel" id="panel-live" aria-labelledby="tab-live" hidden>
+      <div class="panel-head">
+        <h2 class="card-title">Live mic</h2>
+        <span class="tag">Experimental</span>
+      </div>
+      <p class="note">Streams your microphone and scores the newest 2.5 s window each time the previous one finishes (about every 0.6 s on the demo VM). Windows below the speech gate are skipped.</p>
+      <div class="row"><button id="micBtn" class="primary">Start Live Mic</button></div>
+      <div class="mic-footer" id="micFooter"><div id="micFooterText"></div><div id="micLevel"></div></div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="panel-upload" aria-labelledby="tab-upload" hidden>
+      <div class="panel-head"><h2 class="card-title">Upload a clip</h2></div>
+      <p class="note">WAV up to 5 MB (about 20 s). Scored on the center 2.5 s window.</p>
+      <div class="row">
+        <input type="file" id="wavInput" accept=".wav,audio/wav" />
+        <button id="uploadBtn">Analyze WAV</button>
+      </div>
+    </div>
+
+    <div class="panel" role="tabpanel" id="panel-samples" aria-labelledby="tab-samples">
+      <div class="panel-head"><h2 class="card-title">Try samples</h2></div>
+      <p class="note">Six test-split clips picked for the demo. Not a benchmark; see the results table in the README.</p>
+      <div class="samples" id="samplesList"><p class="note">Loading samples…</p></div>
+    </div>
+
+    <div class="channel-row">
       <label class="ctl-label" for="conditionSel">Simulate call channel</label>
       <select id="conditionSel">
         <option value="clean">Clean</option>
         <option value="opus_16k">Opus 16 kbps (WhatsApp-like)</option>
         <option value="phone_8k">Phone 8 kHz</option>
       </select>
-      <input type="file" id="wavInput" accept=".wav,audio/wav" />
-      <button id="uploadBtn">Analyze WAV</button>
     </div>
 
     <section class="banner" id="banner" aria-live="polite">
       <div class="banner-text" id="bannerText">LISTENING</div>
       <div class="banner-fresh" id="bannerFresh"></div>
+      <div class="banner-note">Live mic can false-alarm on voices and mics unlike the training data (21.8% of windows on the builder's own headset).</div>
     </section>
 
     <div class="cards">
@@ -242,7 +368,7 @@
           <span><span class="k">Threshold</span> <span class="v" id="thresholdVal" title="0.5">0.50</span></span>
         </div>
         <canvas id="sparkCanvas" class="spark"></canvas>
-        <div class="caption">Last 30 scored windows</div>
+        <div class="caption">Last 30 scored windows or clips</div>
       </div>
 
       <div class="card">
@@ -263,13 +389,13 @@
       <h2 class="card-title">Model attention focus</h2>
       <canvas id="focusCanvas" class="attn"></canvas>
       <div class="caption">
-        Where the model attended within the 2.5 s window. This shows model focus, not proof that any part of the audio is fake.
+        Where the model attended within the 2.5 s window. It shows model focus only, not which part is fake.
       </div>
     </div>
 
     <div class="card hidden" id="clonePanel">
       <div class="card-title">Private self-clone arena (owner only, auth-gated)</div>
-      <div class="controls" style="margin-top: 4px;">
+      <div class="row" style="margin-top: 4px;">
         <input type="password" id="cloneToken" placeholder="Bearer token" />
         <input type="text" id="cloneText" placeholder="Text to synthesize in your voice" style="flex: 1; min-width: 220px;" />
         <input type="file" id="cloneRefWav" accept=".wav,audio/wav" />
@@ -277,8 +403,6 @@
       </div>
       <audio id="cloneAudio" controls></audio>
     </div>
-
-    <div class="mic-footer" id="micFooter"></div>
   </div>
 
   <script>
@@ -362,6 +486,14 @@
 
     const els = {
       backendBadge: document.getElementById("backendBadge"),
+      tabs: document.querySelector(".tabs"),
+      tabLive: document.getElementById("tab-live"),
+      tabUpload: document.getElementById("tab-upload"),
+      tabSamples: document.getElementById("tab-samples"),
+      panelLive: document.getElementById("panel-live"),
+      panelUpload: document.getElementById("panel-upload"),
+      panelSamples: document.getElementById("panel-samples"),
+      samplesList: document.getElementById("samplesList"),
       micBtn: document.getElementById("micBtn"),
       conditionSel: document.getElementById("conditionSel"),
       wavInput: document.getElementById("wavInput"),
@@ -391,19 +523,22 @@
       cloneRefWav: document.getElementById("cloneRefWav"),
       cloneBtn: document.getElementById("cloneBtn"),
       cloneAudio: document.getElementById("cloneAudio"),
-      micFooter: document.getElementById("micFooter"),
+      micFooterText: document.getElementById("micFooterText"),
+      micLevel: document.getElementById("micLevel"),
     };
 
     const COL = {
-      safe: "#22c55e",
-      warn: "#f59e0b",
-      danger: "#ef4444",
-      muted: "#8b95a7",
-      text: "#e6e9ef",
-      line: "#8b95a7",
+      safe: "#15803d",
+      warn: "#b45309",
+      danger: "#dc2626",
+      muted: "#64748b",
+      text: "#0f172a",
+      line: "#94a3b8",
     };
     const MONO = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
     const SPARK_CAP = 30;
+    const MIC_LEVEL_SAMPLES = 4000; // 0.25 s of 16 kHz audio
+    const MINUS = "\u2212";
 
     let ws = null;
     let audioCtx = null;
@@ -413,14 +548,19 @@
     let baselineLoaded = null;
     let lastBaselineProb = null;
     let scoreHistory = [];
+    let recentClient = [];
     let lastFocus = null;
     let lastProb = null;
     let micFooterState = null;
     let debugCaptureOn = false;
+    let micLevelBuf = [];
+    let levelTimer = null;
+    let lastGateInfo = null;
+    let samplesLoaded = false;
 
     function renderMicFooter() {
       if (!micFooterState) {
-        els.micFooter.textContent = debugCaptureOn
+        els.micFooterText.textContent = debugCaptureOn
           ? "Debug capture ON — saving received audio to results/live_capture/"
           : "";
         return;
@@ -428,12 +568,33 @@
       const st = micFooterState.settings || {};
       const g = (k) => (st[k] === undefined || st[k] === null ? "n/a" : String(st[k]));
       const rate = st.sampleRate;
-      els.micFooter.textContent =
+      els.micFooterText.textContent =
         `Mic: echoCancellation=${g("echoCancellation")} · noiseSuppression=${g("noiseSuppression")}` +
         ` · autoGainControl=${g("autoGainControl")}` +
         ` · device rate ${rate === undefined || rate === null ? "n/a" : rate + " Hz"}` +
         ` · context ${micFooterState.ctxRate} Hz · resampler: ${micFooterState.resamplerMode}` +
         (debugCaptureOn ? " · Debug capture ON — saving received audio to results/live_capture/" : "");
+    }
+
+    function fmtDb(v) {
+      if (v == null || !isFinite(Number(v))) return "--";
+      const r = Math.round(Number(v));
+      if (r === 0) return "0";
+      return r < 0 ? MINUS + Math.abs(r) : String(r);
+    }
+
+    function updateMicLevel() {
+      let db = null;
+      if (micLevelBuf.length) {
+        let sum = 0;
+        for (let i = 0; i < micLevelBuf.length; i++) sum += micLevelBuf[i] * micLevelBuf[i];
+        const rms = Math.sqrt(sum / micLevelBuf.length);
+        db = rms > 0 ? 20 * Math.log10(rms) : -120;
+      }
+      const g = lastGateInfo;
+      const gateTxt = g && g.speech_gate_dbfs != null ? `${fmtDb(g.speech_gate_dbfs)} dBFS` : "--";
+      const floorTxt = g ? ` (floor ${fmtDb(g.noise_floor_dbfs)})` : "";
+      els.micLevel.textContent = `Input ${fmtDb(db)} dBFS · speech gate ${gateTxt}${floorTxt}`;
     }
 
     function colorFor(p, t) {
@@ -590,6 +751,13 @@
         return;
       }
       if (data.threshold != null) setThreshold(data.threshold);
+      if (data.speech_gate_dbfs !== undefined || data.noise_floor_dbfs !== undefined || data.input_dbfs !== undefined) {
+        lastGateInfo = {
+          input_dbfs: data.input_dbfs ?? null,
+          noise_floor_dbfs: data.noise_floor_dbfs ?? null,
+          speech_gate_dbfs: data.speech_gate_dbfs ?? null,
+        };
+      }
 
       const isLive = data.type === "prediction";
       const warming = data.warming_up === true;
@@ -610,9 +778,15 @@
           drawSpark();
         } else {
           const inf = Math.round(Number(data.latency_ms ?? 0));
+          const kind = data.sample_id ? "Sample analysis" : "File analysis";
           setBanner(data.verdict === "spoof" ? "clone" : "real",
-            `File analysis · center 2.5 s window · inference ${inf} ms`);
+            `${kind} · center 2.5 s window · inference ${inf} ms`);
+          scoreHistory.push(prob);
+          if (scoreHistory.length > SPARK_CAP) scoreHistory.shift();
+          drawSpark();
         }
+        recentClient.push(prob);
+        if (recentClient.length > 3) recentClient.shift();
       } else if (isLive) {
         setBanner("listen", data.is_speech === false ? "No speech in the latest window" : "Waiting for the first scored window");
       } else {
@@ -632,7 +806,9 @@
 
       els.recentScores.textContent = Array.isArray(data.recent_scores) && data.recent_scores.length
         ? data.recent_scores.map((p) => Number(p).toFixed(2)).join("  ")
-        : "--";
+        : recentClient.length
+          ? recentClient.map((p) => Number(p).toFixed(2)).join("  ")
+          : "--";
       els.latencyVal.textContent = data.latency_ms != null ? `${Math.round(Number(data.latency_ms))} ms` : "-- ms";
       els.vadStatus.textContent = data.is_speech === true ? "speech" : data.is_speech === false ? "silence" : "--";
 
@@ -680,6 +856,10 @@
       if (mediaStream) { mediaStream.getTracks().forEach((t) => t.stop()); mediaStream = null; }
       if (audioCtx) { await audioCtx.close(); audioCtx = null; }
       if (ws) { ws.close(); ws = null; }
+      if (levelTimer) { clearInterval(levelTimer); levelTimer = null; }
+      micLevelBuf = [];
+      lastGateInfo = null;
+      updateMicLevel();
       els.micBtn.textContent = "Start Live Mic";
       els.micBtn.className = "primary";
       micFooterState = null;
@@ -690,7 +870,10 @@
     els.micBtn.addEventListener("click", async () => {
       if (ws) { await stopMic(); return; }
       scoreHistory = [];
+      recentClient = [];
       drawSpark();
+      micLevelBuf = [];
+      lastGateInfo = null;
       setBanner("listen", "Streaming — first verdict after 2.0 s of audio");
       const proto = location.protocol === "https:" ? "wss" : "ws";
       ws = new WebSocket(`${proto}://${location.host}/ws/detect`);
@@ -738,12 +921,18 @@
           if (!ws || ws.readyState !== WebSocket.OPEN) return;
           const mono = ev.inputBuffer.getChannelData(0);
           const out = resampler ? resampler.process(mono) : mono;
+          for (let i = 0; i < out.length; i++) micLevelBuf.push(out[i]);
+          if (micLevelBuf.length > MIC_LEVEL_SAMPLES) {
+            micLevelBuf.splice(0, micLevelBuf.length - MIC_LEVEL_SAMPLES);
+          }
           ws.send(floatToPcm16(out));
         };
         src.connect(processor);
         processor.connect(audioCtx.destination);
         els.micBtn.textContent = "Stop Live Mic";
         els.micBtn.className = "danger";
+        levelTimer = setInterval(updateMicLevel, 250);
+        updateMicLevel();
       };
       ws.onclose = () => stopMic();
     });
@@ -765,6 +954,152 @@
       if (!res.ok) { alert(data.detail || "Detection failed"); return; }
       renderResult(data);
     });
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      }[c]));
+    }
+
+    function sampleLabel(s) {
+      if (s.id.startsWith("kokoro_")) return `Kokoro clip ${s.id.slice(7)}`;
+      if (s.id.startsWith("ls_")) return `LibriSpeech ${s.id.slice(3)}`;
+      return s.id;
+    }
+
+    function truthTag(s) {
+      return s.truth === "clone" ? "Clone (Kokoro, unseen TTS)" : "Real (LibriSpeech)";
+    }
+
+    async function loadSamples() {
+      try {
+        const res = await fetch("/api/samples");
+        if (!res.ok) throw new Error(`http ${res.status}`);
+        renderSamples(await res.json());
+      } catch (err) {
+        els.samplesList.innerHTML =
+          '<p class="note">Samples unavailable — restore data/cloakbreak_v1.</p>';
+      }
+    }
+
+    function renderSamples(list) {
+      els.samplesList.innerHTML = "";
+      for (const s of list) {
+        const row = document.createElement("div");
+        row.className = "sample-row" + (s.available ? "" : " unavailable");
+        row.dataset.id = s.id;
+        const dur = s.duration_s != null ? `<span class="sample-dur">${Number(s.duration_s).toFixed(1)} s</span>` : "";
+        const audio = s.available
+          ? `<audio class="sample-audio" controls preload="none" src="/api/samples/${encodeURIComponent(s.id)}/audio"></audio>`
+          : "";
+        const off = s.available ? "" : '<span class="truth off">not restored</span>';
+        row.innerHTML = `
+          <div>
+            <div class="sample-name">${escapeHtml(sampleLabel(s))}</div>
+            <div class="sample-sub">
+              <span class="truth ${s.truth === "clone" ? "clone" : "real"}">${escapeHtml(truthTag(s))}</span>
+              ${dur}${off}
+            </div>
+            ${audio}
+          </div>
+          <button class="score-btn" ${s.available ? "" : "disabled"}>Score</button>
+          <div class="sample-res">
+            <div class="res-cell"><span class="res-cap">CloakBreak</span><span class="res-val cb">--</span></div>
+            <div class="res-cell"><span class="res-cap">Legacy</span><span class="res-val bl">--</span></div>
+          </div>`;
+        if (s.available) {
+          row.querySelector(".score-btn").addEventListener("click", () => scoreSample(s.id, row));
+        }
+        els.samplesList.appendChild(row);
+      }
+    }
+
+    function fillSampleResult(row, data, err) {
+      const cb = row.querySelector(".res-val.cb");
+      const bl = row.querySelector(".res-val.bl");
+      cb.textContent = "";
+      bl.textContent = "";
+      if (err || !data) {
+        cb.textContent = err || "error";
+        bl.textContent = "--";
+        return;
+      }
+      const p = Number(data.spoof_prob);
+      const t = data.threshold != null ? Number(data.threshold) : currentThreshold;
+      const num = document.createElement("b");
+      num.textContent = p.toFixed(3);
+      num.style.color = colorFor(p, t);
+      cb.append(num, document.createTextNode(` ${data.verdict === "spoof" ? "Clone" : "Real"}`));
+      if (data.baseline_prob != null) {
+        const bp = Number(data.baseline_prob);
+        const bnum = document.createElement("b");
+        bnum.textContent = bp.toFixed(3);
+        bnum.style.color = colorFor(bp, 0.5);
+        bl.append(bnum, document.createTextNode(bp >= 0.5 ? " Clone" : " Real"));
+      } else {
+        bl.textContent = "not loaded";
+      }
+    }
+
+    async function scoreSample(id, row) {
+      const btn = row.querySelector(".score-btn");
+      btn.disabled = true;
+      btn.textContent = "Scoring…";
+      try {
+        const fd = new FormData();
+        fd.append("condition", els.conditionSel.value);
+        const res = await fetch(`/api/samples/${encodeURIComponent(id)}/detect`, { method: "POST", body: fd });
+        const data = await res.json();
+        if (!res.ok) {
+          fillSampleResult(row, null, data.detail || "request failed");
+          return;
+        }
+        renderResult(data);
+        fillSampleResult(row, data, null);
+      } catch (e) {
+        fillSampleResult(row, null, "request failed");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Score";
+      }
+    }
+
+    const tabDefs = [
+      { tab: els.tabLive, panel: els.panelLive },
+      { tab: els.tabUpload, panel: els.panelUpload },
+      { tab: els.tabSamples, panel: els.panelSamples },
+    ];
+
+    function activateTab(def) {
+      for (const d of tabDefs) {
+        const on = d === def;
+        d.tab.setAttribute("aria-selected", on ? "true" : "false");
+        d.tab.tabIndex = on ? 0 : -1;
+        d.panel.hidden = !on;
+      }
+      if (def === tabDefs[2] && !samplesLoaded) {
+        samplesLoaded = true;
+        loadSamples();
+      }
+    }
+
+    for (const d of tabDefs) {
+      d.tab.addEventListener("click", () => activateTab(d));
+    }
+    els.tabs.addEventListener("keydown", (e) => {
+      const idx = tabDefs.findIndex((d) => d.tab === document.activeElement);
+      if (idx < 0) return;
+      let next = idx;
+      if (e.key === "ArrowRight") next = (idx + 1) % tabDefs.length;
+      else if (e.key === "ArrowLeft") next = (idx - 1 + tabDefs.length) % tabDefs.length;
+      else if (e.key === "Home") next = 0;
+      else if (e.key === "End") next = tabDefs.length - 1;
+      else return;
+      e.preventDefault();
+      activateTab(tabDefs[next]);
+      tabDefs[next].tab.focus();
+    });
+    activateTab(tabDefs[2]); // default tab: Try samples
 
     els.cloneBtn.addEventListener("click", async () => {
       const f = els.cloneRefWav.files[0];
@@ -804,6 +1139,7 @@
     });
     drawAttention([], null);
     drawSpark();
+    updateMicLevel();
     fetchHealth();
   </script>
 </body>

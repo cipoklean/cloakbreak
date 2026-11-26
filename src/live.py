@@ -17,7 +17,7 @@ from typing import Any, Awaitable, Callable, Deque, Dict, Optional
 
 import numpy as np
 
-from src.audio_utils import RollingAudioBuffer, rms_vad
+from src.audio_utils import RollingAudioBuffer, SpeechGate, rms_dbfs
 
 EmitFn = Callable[[Dict[str, Any]], Awaitable[None]]
 ScoreFn = Callable[[np.ndarray], Dict[str, Any]]
@@ -59,6 +59,7 @@ class LiveScorer:
         self._ring = RollingAudioBuffer(window_sec=window_sec, stride_sec=stride_sec, sr=sr)
         self._window_samples = self._ring.window_samples
         self._stride_samples = self._ring.stride_samples
+        self._gate = SpeechGate(sr=sr)
 
         self._event = asyncio.Event()
         self._stop = False
@@ -90,6 +91,7 @@ class LiveScorer:
         if chunk.size == 0:
             return
         self._ring.push(chunk)
+        self._gate.push(chunk)
         self.total_samples += int(chunk.size)
         self.n_pushed_chunks += 1
         self.last_arrival = float(self._clock())
@@ -128,6 +130,14 @@ class LiveScorer:
     def _filled_sec(self, total: int) -> float:
         return min(total, self._window_samples) / float(self.sr)
 
+    def _gate_fields(self, window: np.ndarray) -> Dict[str, Any]:
+        floor = self._gate.noise_floor_dbfs()
+        return {
+            "input_dbfs": round(rms_dbfs(window), 1),
+            "noise_floor_dbfs": round(floor, 1) if floor is not None else None,
+            "speech_gate_dbfs": round(self._gate.gate_dbfs(), 1),
+        }
+
     async def _dispatch(self, emit: EmitFn) -> None:
         total = self.total_samples
         filled_sec = self._filled_sec(total)
@@ -137,11 +147,13 @@ class LiveScorer:
             stride_idx = total // self._stride_samples
             if stride_idx != self._last_warm_stride_idx:
                 self._last_warm_stride_idx = stride_idx
+                warm_window = self._ring.get_window()
                 await emit(
                     {
                         "type": "prediction",
                         "warming_up": True,
-                        "is_speech": rms_vad(self._ring.get_window()),
+                        "is_speech": self._gate.is_speech(warm_window),
+                        **self._gate_fields(warm_window),
                         "spoof_prob": None,
                         "baseline_prob": None,
                         "window_verdict": None,
@@ -193,10 +205,12 @@ class LiveScorer:
                 "dropped_windows": self.dropped_windows,
                 "window_sec": window_sec,
             }
-            if not rms_vad(window):
+            gate_fields = self._gate_fields(window)
+            if not self._gate.is_speech(window):
                 await emit(
                     {
                         **base,
+                        **gate_fields,
                         "is_speech": False,
                         "spoof_prob": None,
                         "baseline_prob": None,
@@ -244,6 +258,7 @@ class LiveScorer:
             await emit(
                 {
                     **base,
+                    **gate_fields,
                     "is_speech": True,
                     "spoof_prob": prob,
                     "baseline_prob": res.get("baseline_prob"),

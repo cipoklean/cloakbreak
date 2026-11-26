@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
-from app.main import AppState, create_app
+from app.main import SAMPLE_CLIPS, AppState, create_app
 from scripts import hf_auth_check
 from src.audio_utils import (
     TARGET_RMS,
@@ -452,7 +452,24 @@ def test_frontend_demo_page_static() -> None:
         assert state in html
     low = html.lower()
     assert "where the model attended" in low
-    assert "not proof" in low
+    assert "proof" not in low
+    # Try-samples tabs with ARIA wiring and the exact labels
+    assert 'role="tablist"' in html
+    for tab in ("Live mic (experimental)", "Upload a clip", "Try samples"):
+        assert tab in html
+    # honest-limit chips
+    for chip in (
+        "Noise: 16.6% EER at 10 dB SNR",
+        "Clips under 1 s: at chance",
+        "Live mic: false alarms on unfamiliar mics (21.8% of windows on the builder's headset)",
+    ):
+        assert chip in html
+    # verdict card always carries the false-alarm caveat
+    assert (
+        "Live mic can false-alarm on voices and mics unlike the training data "
+        "(21.8% of windows on the builder's own headset)." in html
+    )
+    assert "Experimental" in html
 
 
 def test_frontend_mic_audio_path_static() -> None:
@@ -469,6 +486,101 @@ def test_frontend_mic_audio_path_static() -> None:
     ):
         assert needle in html, f"missing {needle}"
     assert "downsampleTo16k" not in html
+
+
+def _write_sample_tree(root: Path, skip: str | None = None) -> dict[str, bytes]:
+    """Synthetic 3 s WAV at every SAMPLE_CLIPS relative path under ``root``."""
+    blobs: dict[str, bytes] = {}
+    for i, (sid, meta) in enumerate(SAMPLE_CLIPS.items()):
+        if sid == skip:
+            continue
+        path = root / meta["path"]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        wav = _make_dummy_speech(3.0, freq_hz=180.0 + i * 20.0, seed=i)
+        blob = wav_to_bytes(wav, TARGET_SR)
+        path.write_bytes(blob)
+        blobs[sid] = blob
+    return blobs
+
+
+def test_samples_endpoints_list_detect_audio(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Try-samples API: allowlisted ids only, same scoring path as uploads."""
+    monkeypatch.setenv("CLOAKBREAK_BACKEND", "mock")
+    monkeypatch.setenv("ENABLE_CLONE_ENDPOINT", "false")
+    sdir = tmp_path / "samples"
+    blobs = _write_sample_tree(sdir)
+    monkeypatch.setenv("CLOAKBREAK_SAMPLES_DIR", str(sdir))
+    client = TestClient(create_app(AppState()))
+
+    health = client.get("/api/health").json()
+    assert health["clone_enabled"] is False
+    assert health["samples_available"] == len(SAMPLE_CLIPS)
+
+    r = client.get("/api/samples")
+    assert r.status_code == 200
+    samples = r.json()
+    assert [s["id"] for s in samples] == list(SAMPLE_CLIPS)
+    for s in samples:
+        assert set(s) == {"id", "truth", "source", "available", "duration_s"}
+        assert s["available"] is True
+        assert s["duration_s"] == pytest.approx(3.0, abs=0.05)
+
+    # Sample detect must equal detect-file on the same bytes, plus id/truth.
+    sid = "kokoro_00483"
+    up = client.post(
+        "/api/detect-file",
+        files={"file": ("clip.wav", blobs[sid], "audio/wav")},
+        data={"condition": "clean"},
+    )
+    assert up.status_code == 200
+    file_res = up.json()
+    sd = client.post(f"/api/samples/{sid}/detect", data={"condition": "clean"})
+    assert sd.status_code == 200
+    sdet = sd.json()
+    assert sdet["sample_id"] == sid
+    assert sdet["truth"] == "clone"
+    for key in (
+        "spoof_prob", "baseline_prob", "attention_focus", "backend",
+        "condition", "duration_s", "is_speech", "threshold", "verdict",
+    ):
+        assert sdet[key] == file_res[key], key
+    # latency_ms is wall-clock and legitimately differs between calls.
+
+    # Audio endpoint serves the allowlisted WAV bytes.
+    ra = client.get(f"/api/samples/{sid}/audio")
+    assert ra.status_code == 200
+    assert ra.content[:4] == b"RIFF"
+    assert ra.content == blobs[sid]
+
+    # Unknown and traversal-ish ids 404 on both endpoints.
+    for bad in ("nope", "..%2F..%2Fetc%2Fpasswd", "kokoro_00483.wav", "../x"):
+        assert client.post(f"/api/samples/{bad}/detect").status_code == 404, bad
+        assert client.get(f"/api/samples/{bad}/audio").status_code == 404, bad
+
+
+def test_samples_missing_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A known id whose WAV is absent reports unavailable and 404s on use."""
+    monkeypatch.setenv("CLOAKBREAK_BACKEND", "mock")
+    sdir = tmp_path / "samples"
+    missing = "ls_672-122797-0057"
+    _write_sample_tree(sdir, skip=missing)
+    monkeypatch.setenv("CLOAKBREAK_SAMPLES_DIR", str(sdir))
+    client = TestClient(create_app(AppState()))
+
+    health = client.get("/api/health").json()
+    assert health["samples_available"] == len(SAMPLE_CLIPS) - 1
+
+    samples = {s["id"]: s for s in client.get("/api/samples").json()}
+    assert samples[missing]["available"] is False
+    assert samples[missing]["duration_s"] is None
+    assert samples["kokoro_00483"]["available"] is True
+
+    r = client.post(f"/api/samples/{missing}/detect")
+    assert r.status_code == 404
+    assert "restore data/cloakbreak_v1" in r.json()["detail"]
+    assert client.get(f"/api/samples/{missing}/audio").status_code == 404
 
 
 def test_app_threshold_precedence_verdict_and_min_window(
