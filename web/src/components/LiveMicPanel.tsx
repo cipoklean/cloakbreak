@@ -379,62 +379,61 @@ export function LiveMicPanel({ condition, snapshot, setSnapshot, debugCapture, o
   const floorText = snapshot.gate.noiseFloorDbfs != null ? ` (floor ${formatDbfs(snapshot.gate.noiseFloorDbfs)})` : "";
 
   return (
-    <div className="space-y-4" data-testid="live-panel">
-      <div>
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="text-base font-semibold text-slate-950">Live mic</h2>
-          <span className="rounded-full border border-amber-300 bg-amber-100 px-2.5 py-1 text-xs font-semibold text-amber-800">Experimental</span>
-        </div>
-        <p className="mt-2 max-w-3xl text-sm leading-relaxed text-slate-600">
-          Streams your microphone and scores the newest 2.5 s window each time the previous one finishes. Windows below the speech gate are skipped.
-        </p>
+    <div data-testid="live-panel">
+      <div className="flex flex-wrap items-center gap-2">
+        <h2 className="text-base font-medium text-cb-text">Live mic</h2>
+        <span className="rounded-lg border border-cb-border px-2 py-1 text-xs font-medium text-cb-muted">Experimental</span>
       </div>
+      <p className="mt-2 max-w-3xl text-sm leading-relaxed text-cb-muted">
+        Streams your microphone and scores the newest 2.5 s window each time the previous one finishes. Windows below the speech gate are skipped.
+      </p>
 
-      {snapshot.error ? (
-        <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-800" role="alert" data-testid="live-error">
-          {snapshot.error}
-        </p>
-      ) : null}
-
-      <div className="flex flex-col gap-4 rounded-xl border border-[#d5e2f0] bg-slate-50 p-4 sm:flex-row sm:items-center">
-        <Button
-          variant={active ? "danger" : "primary"}
-          className="min-h-14 px-6 text-base"
-          data-testid="live-mic-button"
-          onClick={() => {
-            if (active || wsRef.current != null) stopMic();
-            else startMic();
-          }}
-        >
-          {active ? "Stop mic" : "Start mic"}
-        </Button>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-sm font-semibold text-slate-950">Voice activity</span>
-            <span
-              className={`rounded-full px-2.5 py-1 text-xs font-semibold ${snapshot.voiceActivity === "speech" ? "bg-green-100 text-green-900" : snapshot.voiceActivity === "silence" ? "bg-slate-200 text-slate-700" : "bg-slate-100 text-slate-500"}`}
-              data-testid="voice-activity"
-            >
-              {snapshot.voiceActivity ?? "--"}
-            </span>
-            <span className="text-sm text-slate-600" data-testid="live-notice">{snapshot.notice}</span>
-          </div>
-          <div className="mt-3">
-            <div className="flex items-center justify-between gap-3 text-xs font-medium text-slate-600">
-              <span>Input level</span>
-              <span className="font-mono tabular-nums" data-testid="input-level-number">{formatDbfs(level)} dBFS</span>
+      <div className="mt-4 rounded-lg border border-cb-border bg-cb-bg p-4">
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
+          <Button
+            variant={active ? "secondary" : "primary"}
+            className="min-h-14 px-6 text-base"
+            data-testid="live-mic-button"
+            onClick={() => {
+              if (active || wsRef.current != null) stopMic();
+              else startMic();
+            }}
+          >
+            {active ? "Stop mic" : "Start mic"}
+          </Button>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium text-cb-text">Voice activity</span>
+              <span
+                className={`rounded-lg border px-2 py-1 text-xs font-medium ${snapshot.voiceActivity === "speech" ? "border-cb-real text-cb-real" : "border-cb-border text-cb-muted"}`}
+                data-testid="voice-activity"
+              >
+                {snapshot.voiceActivity ?? "--"}
+              </span>
+              <span className="text-sm text-cb-muted" data-testid="live-notice">{snapshot.notice}</span>
             </div>
-            <div className="mt-1 h-3 overflow-hidden rounded-full border border-[#d5e2f0] bg-white" data-testid="input-level-meter" aria-hidden="true">
-              <div className="h-full rounded-full bg-[#0369a1] transition-[width] duration-150" style={{ width: `${levelWidth}%` }} />
+            <div className="mt-3">
+              <div className="flex items-center justify-between gap-3 text-xs font-medium text-cb-muted">
+                <span>Input level</span>
+                <span className="font-mono tabular-nums" data-testid="input-level-number">{formatDbfs(level)} dBFS</span>
+              </div>
+              <div className="mt-1 h-3 overflow-hidden rounded-lg border border-cb-border bg-cb-surface" data-testid="input-level-meter" aria-hidden="true">
+                <div className="h-full rounded-lg bg-cb-secondary transition-[width] duration-150" style={{ width: `${levelWidth}%` }} />
+              </div>
+              <p className="mt-1 font-mono text-xs tabular-nums text-cb-muted" data-testid="input-level-line">
+                Input {formatDbfs(level)} dBFS · speech gate {gateText}{floorText}
+              </p>
             </div>
-            <p className="mt-1 font-mono text-xs tabular-nums text-slate-600" data-testid="input-level-line">
-              Input {formatDbfs(level)} dBFS · speech gate {gateText}{floorText}
-            </p>
+            {debugCapture ? (
+              <p className="mt-2 text-xs font-medium text-cb-secondary">Debug capture ON — saving received audio to results/live_capture/</p>
+            ) : null}
           </div>
-          {debugCapture ? (
-            <p className="mt-2 text-xs font-medium text-amber-800">Debug capture ON — saving received audio to results/live_capture/</p>
-          ) : null}
         </div>
+        {snapshot.error ? (
+          <p className="mt-4 rounded-lg border border-cb-clone px-3 py-2 text-sm font-medium text-cb-clone" role="alert" data-testid="live-error">
+            {snapshot.error}
+          </p>
+        ) : null}
       </div>
     </div>
   );

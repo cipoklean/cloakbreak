@@ -41,7 +41,7 @@ export function Tabs({ activeTab, onChange }: TabsProps) {
     <div
       role="tablist"
       aria-label="Input source"
-      className="inline-flex max-w-full flex-wrap gap-1 rounded-xl border border-[#d5e2f0] bg-slate-100 p-1"
+      className="grid w-full grid-cols-1 gap-1 rounded-lg border border-cb-border bg-cb-bg p-1 sm:flex sm:w-auto sm:flex-wrap"
       onKeyDown={onKeyDown}
     >
       {TAB_DEFS.map((tab) => {
@@ -59,8 +59,10 @@ export function Tabs({ activeTab, onChange }: TabsProps) {
             aria-selected={selected}
             tabIndex={selected ? 0 : -1}
             data-testid={`tab-${tab.id}`}
-            className={`min-h-11 rounded-lg px-4 py-2 text-sm font-semibold transition duration-150 hover:text-slate-950 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0369a1] focus-visible:ring-offset-2 ${
-              selected ? "bg-white text-slate-950 shadow-sm" : "text-slate-600"
+            className={`min-h-11 rounded-lg border px-4 py-2 text-sm font-medium transition-[color,background-color,border-color] duration-150 ${
+              selected
+                ? "border-cb-border bg-cb-surface text-cb-text"
+                : "border-transparent text-cb-muted hover:text-cb-text"
             }`}
             onClick={() => activate(tab.id)}
           >

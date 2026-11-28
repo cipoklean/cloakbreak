@@ -1,14 +1,12 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 
-type ButtonVariant = "primary" | "secondary" | "danger";
+type ButtonVariant = "primary" | "secondary";
 
 const variantClasses: Record<ButtonVariant, string> = {
   primary:
-    "border border-[#0369a1] bg-[#0369a1] text-white hover:bg-[#075985] disabled:border-[#7ba7c7] disabled:bg-[#7ba7c7]",
+    "border border-cb-text bg-cb-text text-cb-bg hover:bg-cb-secondary disabled:border-cb-muted disabled:bg-cb-muted disabled:text-cb-bg",
   secondary:
-    "border border-slate-300 bg-white text-slate-800 hover:bg-slate-100 disabled:text-slate-400",
-  danger:
-    "border border-red-700 bg-red-700 text-white hover:bg-red-800 disabled:border-red-300 disabled:bg-red-300",
+    "border border-cb-border bg-transparent text-cb-text hover:border-cb-muted hover:bg-cb-bg disabled:text-cb-muted",
 };
 
 interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -20,7 +18,7 @@ export function Button({ variant = "secondary", className = "", children, type =
   return (
     <button
       type={type}
-      className={`inline-flex min-h-11 items-center justify-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold shadow-sm transition duration-150 hover:brightness-95 active:scale-[0.98] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0369a1] focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:brightness-100 disabled:active:scale-100 ${variantClasses[variant]} ${className}`}
+      className={`inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-[color,background-color,border-color,transform] duration-150 active:translate-y-px disabled:cursor-not-allowed disabled:opacity-55 disabled:active:translate-y-0 ${variantClasses[variant]} ${className}`}
       {...rest}
     >
       {children}

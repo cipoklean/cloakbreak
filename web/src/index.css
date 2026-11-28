@@ -1,17 +1,38 @@
 @import "tailwindcss";
 
+@theme {
+  --font-sans: "Geist Variable", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "Geist Mono Variable", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --color-cb-bg: #0a0c0f;
+  --color-cb-surface: #12161c;
+  --color-cb-border: #29313b;
+  --color-cb-text: #f3f6f8;
+  --color-cb-secondary: #b6c0ca;
+  --color-cb-muted: #7d8994;
+  --color-cb-clone: #ff5a64;
+  --color-cb-real: #35d07f;
+}
+
 :root {
-  color-scheme: light;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color-scheme: dark;
+  font-family: var(--font-sans);
+  background: var(--color-cb-bg);
 }
 
 html {
-  background: #dceefb;
+  background: var(--color-cb-bg);
 }
 
 body {
   min-width: 320px;
-  background: #dceefb;
+  background: var(--color-cb-bg);
+  color: var(--color-cb-text);
+  font-family: var(--font-sans);
+}
+
+strong {
+  font-weight: 600;
 }
 
 #root {
@@ -23,4 +44,70 @@ select,
 input,
 summary {
   touch-action: manipulation;
+}
+
+button,
+input,
+select,
+summary,
+[role="button"] {
+  outline-color: transparent;
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible {
+  outline: 2px solid var(--color-cb-secondary) !important;
+  outline-offset: 2px !important;
+}
+
+.cb-card {
+  border: 1px solid var(--color-cb-border);
+  border-radius: 8px;
+  background: var(--color-cb-surface);
+}
+
+.cb-input {
+  min-height: 44px;
+  border: 1px solid var(--color-cb-border);
+  border-radius: 8px;
+  background: var(--color-cb-bg);
+  color: var(--color-cb-text);
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+
+.cb-input:hover {
+  border-color: var(--color-cb-muted);
+}
+
+@keyframes faceoff-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.faceoff-enter {
+  animation: faceoff-enter 320ms cubic-bezier(0.2, 0.8, 0.2, 1) 1 both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+
+  .faceoff-enter {
+    animation: none;
+  }
 }

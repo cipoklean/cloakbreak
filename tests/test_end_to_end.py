@@ -464,8 +464,10 @@ def test_frontend_demo_page_static() -> None:
     assert "Simulate call channel" in src
     for label in ("Clean", "Opus 16 kbps (WhatsApp-like)", "Phone 8 kHz"):
         assert label in src
-    for state in ("REAL VOICE", "LIKELY CLONE", "LISTENING", "ANALYZING"):
+    for state in ("CLONE", "REAL", "Analyzing", "Pick a sample, drop a file, or start the mic"):
         assert state in src
+    assert 'data-testid="faceoff-card"' in src
+    assert "Window details" in src
     low = src.lower()
     assert "where the model attended" in low
     assert "proof" not in low

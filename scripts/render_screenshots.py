@@ -138,7 +138,7 @@ OVERFLOW_JS = """() => {
     return el.tagName.toLowerCase() + (tid ? '[data-testid=' + tid + ']' : cls);
   };
   const boxes = document.querySelectorAll(
-    '[data-testid=input-card], [data-testid=verdict-card], [data-testid^=sample-card-], .card'
+    '[data-testid=input-card], [data-testid=faceoff-card], [data-testid^=sample-card-], .cb-card'
   );
   boxes.forEach((box) => {
     const r = box.getBoundingClientRect();
@@ -181,8 +181,12 @@ def _wait_contains(page, selector: str, text: str, timeout: float) -> None:
     )
 
 
+def _wait_waveform(page) -> None:
+    page.locator('[data-testid="waveform-strip"]').wait_for(state="attached", timeout=15000)
+
+
 def _capture(page, path: Path, label: str) -> None:
-    page.wait_for_timeout(350)  # let the score-bar width transitions settle
+    page.wait_for_timeout(700)  # let the score reveal and bar transitions settle
     _assert_no_overflow(page, label)
     page.screenshot(path=str(path), full_page=True)
     print(f"[shots] {path.relative_to(REPO_ROOT)}", flush=True)
@@ -211,6 +215,16 @@ def _analyze_sample(page, sample_id: str) -> dict[str, Any]:
         timeout=180000,
     )
     button.click()
+    page.wait_for_function(
+        "(sid) => (document.querySelector(`[data-testid=analyze-sample-${sid}]`) || {}).disabled === true",
+        arg=sample_id,
+        timeout=10000,
+    )
+    page.wait_for_function(
+        "(sid) => (document.querySelector(`[data-testid=analyze-sample-${sid}]`) || {}).disabled === false",
+        arg=sample_id,
+        timeout=180000,
+    )
     page.locator(f'[data-testid="sample-result-{sample_id}"]').wait_for(state="visible", timeout=180000)
     page.wait_for_timeout(150)
     rows = page.evaluate(
@@ -241,11 +255,6 @@ def _analyze_sample(page, sample_id: str) -> dict[str, Any]:
     }
 
 
-def _show_sample_result(page, sample_id: str, label_fragment: str) -> None:
-    page.locator(f'[data-testid="show-result-{sample_id}"]').click()
-    _wait_contains(page, '[data-testid="timeline-meta"]', label_fragment, 15000)
-
-
 def _select_upload_file(page, path: Path) -> None:
     page.locator('[data-testid="upload-file-input"]').set_input_files(str(path))
     _wait_contains(page, '[data-testid="selected-file-name"]', path.name, 10000)
@@ -253,7 +262,7 @@ def _select_upload_file(page, path: Path) -> None:
 
 def _open_upload_tab(page) -> None:
     page.locator('[data-testid="tab-upload"]').click()
-    page.locator('[data-testid="upload-file-input"]').wait_for(state="visible", timeout=10000)
+    page.locator('[data-testid="upload-file-input"]').wait_for(state="attached", timeout=10000)
 
 
 def _make_media(workdir: Path) -> tuple[Path, Path]:
@@ -294,9 +303,11 @@ def _samples_desktop(page, browser, base_url: str) -> list[dict[str, Any]]:
         print(f"[shots] analyzing sample {sample_id} (desktop results capture)", flush=True)
         entries.append(_analyze_sample(page, sample_id))
 
-    _show_sample_result(page, KOKORO_SHOT, "Kokoro clip 00483")
+    _analyze_sample(page, KOKORO_SHOT)
+    _wait_waveform(page)
     _capture(page, OUT_DIR / "real-samples-kokoro-desktop.png", "real-samples-kokoro-desktop")
-    _show_sample_result(page, LIBRISPEECH_SHOT, "LibriSpeech 8463-294828-0031")
+    _analyze_sample(page, LIBRISPEECH_SHOT)
+    _wait_waveform(page)
     _capture(page, OUT_DIR / "real-samples-librispeech-desktop.png", "real-samples-librispeech-desktop")
     return entries
 
@@ -307,9 +318,11 @@ def _samples_mobile(browser, base_url: str) -> None:
         _wait_samples(page)
         print("[shots] analyzing kokoro sample (mobile)", flush=True)
         _analyze_sample(page, KOKORO_SHOT)
+        _wait_waveform(page)
         _capture(page, OUT_DIR / "real-samples-kokoro-mobile.png", "real-samples-kokoro-mobile")
         print("[shots] analyzing LibriSpeech sample (mobile)", flush=True)
         _analyze_sample(page, LIBRISPEECH_SHOT)
+        _wait_waveform(page)
         _capture(page, OUT_DIR / "real-samples-librispeech-mobile.png", "real-samples-librispeech-mobile")
     finally:
         ctx.close()
@@ -323,6 +336,7 @@ def _upload_scenario(browser, base_url: str, upload_mp3: Path, viewport: dict[st
         page.locator('[data-testid="analyze-upload-button"]').click()
         page.locator('[data-testid="timeline-meta"]').wait_for(state="visible", timeout=180000)
         _wait_contains(page, '[data-testid="timeline-meta"]', upload_mp3.name, 15000)
+        _wait_waveform(page)
         _capture(page, OUT_DIR / f"real-upload-{suffix}.png", f"real-upload-{suffix}")
     finally:
         ctx.close()

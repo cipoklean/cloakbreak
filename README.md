@@ -56,7 +56,7 @@ Real calls are compressed, band-limited and noisy, so a detector has to work aft
 
 The running app after analyzing the six Try samples clips (fp32 ONNX on the Oracle ARM VM, Clean channel, legacy detector loaded):
 
-![CloakBreak React UI showing a Kokoro clone analysis: red LIKELY CLONE verdict, CloakBreak 1.000 versus legacy detector 0.080, per-window timeline and attention focus](docs/screenshots/real-samples-kokoro-desktop.png)
+![CloakBreak React UI showing a Kokoro clone analysis: red CLONE verdict, CloakBreak 1.000 versus legacy detector 0.080, per-window timeline and attention focus](docs/screenshots/real-samples-kokoro-desktop.png)
 
 *Real screenshot with real scores from the new all-window analysis UI, rendered by `scripts/render_screenshots.py`; the displayed values are saved in [`results/try_samples_real.json`](results/try_samples_real.json). The six clips are test-split files picked for the demo, not a benchmark. More real captures: [Kokoro mobile](docs/screenshots/real-samples-kokoro-mobile.png), [LibriSpeech desktop](docs/screenshots/real-samples-librispeech-desktop.png), [LibriSpeech mobile](docs/screenshots/real-samples-librispeech-mobile.png), [upload desktop](docs/screenshots/real-upload-desktop.png), [upload mobile](docs/screenshots/real-upload-mobile.png), [busy-queue desktop](docs/screenshots/real-busy-desktop.png), [busy-queue mobile](docs/screenshots/real-busy-mobile.png).*
 

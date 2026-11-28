@@ -8,7 +8,7 @@ function inlineMarkdown(text: string): ReactNode[] {
   return parts.map((part, index) => {
     if (part.startsWith("`") && part.endsWith("`") && part.length >= 2) {
       return (
-        <code key={index} className="rounded bg-slate-100 px-1 py-0.5 font-mono text-[0.9em] text-slate-900">
+        <code key={index} className="rounded bg-cb-bg px-1 py-0.5 font-mono text-[0.9em] text-cb-text">
           {part.slice(1, -1)}
         </code>
       );
@@ -76,11 +76,11 @@ function parseMarkdown(markdown: string): MarkdownBlock[] {
 export function SafeMarkdown({ markdown }: { markdown: string }) {
   const blocks = parseMarkdown(markdown);
   return (
-    <div className="space-y-3 text-sm leading-relaxed text-slate-700" data-testid="honest-limits-markdown">
+    <div className="space-y-3 text-sm leading-relaxed text-cb-secondary" data-testid="honest-limits-markdown">
       {blocks.map((block, index) => {
         if (block.type === "heading") {
           return (
-            <h3 key={index} className={`font-bold text-slate-950 ${block.level === 2 ? "text-lg" : "text-base"}`}>
+            <h3 key={index} className={`font-medium text-cb-text ${block.level === 2 ? "text-lg" : "text-base"}`}>
               {inlineMarkdown(block.text)}
             </h3>
           );
@@ -153,26 +153,26 @@ export function HonestLimits({ facts }: HonestLimitsProps) {
   }
 
   return (
-    <section className="card rounded-2xl border border-[#d5e2f0] bg-white p-5 shadow-sm" data-testid="honest-limits-area">
+    <section className="cb-card p-4 sm:p-5" data-testid="honest-limits-area">
       {chips.length ? (
         <div className="flex flex-wrap gap-2" aria-label="Honest limits">
           {chips.map((chip) => (
-            <span key={chip} className="rounded-full border border-[#d5e2f0] bg-slate-50 px-3 py-1.5 text-sm text-slate-700" data-testid="honest-chip">
+            <span key={chip} className="rounded-lg border border-cb-border bg-cb-bg px-3 py-1.5 text-sm text-cb-secondary" data-testid="honest-chip">
               {chip}
             </span>
           ))}
         </div>
       ) : null}
       <details className="group mt-4" onToggle={onToggle} data-testid="honest-limits-expander">
-        <summary className="flex min-h-11 cursor-pointer list-none items-center rounded-xl border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 transition duration-150 hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0369a1] focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
+        <summary className="flex min-h-11 cursor-pointer list-none items-center rounded-lg border border-cb-border bg-cb-bg px-4 py-2 text-sm font-medium text-cb-text transition-colors duration-150 hover:border-cb-muted [&::-webkit-details-marker]:hidden">
           <span>How it works and its limits</span>
-          <span className="ml-auto text-slate-500 transition duration-150 group-open:rotate-90" aria-hidden="true">
+          <span className="ml-auto text-cb-muted transition duration-150 group-open:rotate-90" aria-hidden="true">
             ›
           </span>
         </summary>
-        <div className="mt-3 rounded-xl border border-[#d5e2f0] bg-slate-50 p-4">
-          {loading ? <p className="text-sm text-slate-600">Loading limits…</p> : null}
-          {error ? <p className="text-sm font-medium text-red-700">{error}</p> : null}
+        <div className="mt-3 rounded-lg border border-cb-border bg-cb-bg p-4">
+          {loading ? <p className="text-sm text-cb-muted">Loading limits…</p> : null}
+          {error ? <p className="text-sm font-medium text-cb-clone">{error}</p> : null}
           {markdown ? <SafeMarkdown markdown={markdown} /> : null}
         </div>
       </details>

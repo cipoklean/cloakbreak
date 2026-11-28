@@ -1,14 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { apiUrl, getJson, postForm, postJson } from "./api";
 import { AttentionHeatmap } from "./components/AttentionHeatmap";
-import { DetectorCards } from "./components/DetectorCards";
+import { Faceoff } from "./components/Faceoff";
 import { HonestLimits } from "./components/HonestLimits";
 import { LiveMicPanel } from "./components/LiveMicPanel";
 import { SamplesPanel } from "./components/SamplesPanel";
 import { Tabs, type TabId } from "./components/Tabs";
 import { Timeline, type TimelineWindowItem } from "./components/Timeline";
 import { UploadLinkPanel } from "./components/UploadLinkPanel";
-import { VerdictCard } from "./components/VerdictCard";
 import { useAudioPlayer } from "./hooks";
 import type {
   AnalysisResult,
@@ -26,11 +25,10 @@ import {
   errorText,
   formatDbfs,
   formatMeasuredNumber,
+  formatScore,
   formatThreshold,
-  jobProgressText,
   peakWindowIndex,
   percentFromFraction,
-  resultReason,
   sampleDisplayName,
 } from "./utils";
 
@@ -228,25 +226,6 @@ export default function App() {
     [condition, submitAnalysis],
   );
 
-  const showSampleResult = useCallback(
-    (sampleId: string) => {
-      const result = sampleResults[sampleId];
-      if (!result) return;
-      setCurrentResult({
-        result,
-        inputType: "sample",
-        sourceLabel: sampleDisplayName(sampleId),
-        sampleId,
-        audioUrl: apiUrl(`/api/samples/${encodeURIComponent(sampleId)}/audio`),
-      });
-      const peak = peakWindowIndex(result.windows);
-      setSelectedWindowKey(peak != null ? `analysis-${peak}` : null);
-      setDisplayMode("analysis");
-      setAnalysisError(null);
-    },
-    [sampleResults],
-  );
-
   const threshold = liveSnapshot.threshold ?? currentResult?.result.threshold ?? health?.threshold ?? 0.5;
 
   const analysisItems: TimelineWindowItem[] = useMemo(() => {
@@ -301,29 +280,41 @@ export default function App() {
   const detectorLegacyScore = showingLive ? liveSnapshot.latestScored?.baselineProb ?? null : peakAnalysisWindow?.baseline_prob ?? null;
 
   const result = currentResult?.result ?? null;
-  let verdictState: "real" | "clone" | "listening" | "analyzing" = "listening";
-  let verdictScore: number | null = null;
-  let verdictReason = "Nothing analyzed yet. Choose a sample, upload audio, paste a link, or start the mic.";
-  let freshness: string | null = null;
-
-  if (inFlight) {
-    verdictState = "analyzing";
-    verdictReason = jobProgressText(jobProgress) ?? "Analysis is starting.";
-  } else if (showingLive) {
-    verdictScore = liveSnapshot.status === "streaming" ? liveSnapshot.latestScored?.spoofProb ?? null : null;
-    freshness = liveSnapshot.status === "streaming" ? liveSnapshot.freshness : null;
-    if (liveSnapshot.status === "streaming" && liveSnapshot.latestScored && liveSnapshot.verdict) {
-      verdictState = liveSnapshot.verdict === "spoof" ? "clone" : "real";
-      verdictReason = liveSnapshot.notice;
-    } else {
-      verdictState = "listening";
-      verdictReason = liveSnapshot.error ?? liveSnapshot.notice;
-    }
-  } else if (result) {
-    verdictState = result.verdict === "spoof" ? "clone" : "real";
-    verdictScore = result.max_spoof_prob;
-    verdictReason = resultReason(result);
-  }
+  const freshness = showingLive && liveSnapshot.status === "streaming" ? liveSnapshot.freshness : null;
+  const cloakVerdict = showingLive
+    ? liveSnapshot.latestScored && liveSnapshot.verdict
+      ? liveSnapshot.verdict === "spoof"
+        ? "clone"
+        : "real"
+      : null
+    : result
+      ? result.verdict === "spoof"
+        ? "clone"
+        : "real"
+      : null;
+  const faceoffMode = inFlight ? "analyzing" : showingLive ? "live" : result ? "analysis" : "idle";
+  const analysisSummary = result
+    ? result.n_speech > 0 && result.max_spoof_prob != null
+      ? `${result.n_over_threshold} of ${result.n_speech} speech ${result.n_speech === 1 ? "window" : "windows"} over the threshold (max ${formatScore(result.max_spoof_prob)})`
+      : "No speech window was scored"
+    : null;
+  const faceoffSummary = showingLive ? liveSnapshot.error ?? liveSnapshot.notice : analysisSummary;
+  const faceoffRevealKey = showingLive
+    ? liveSnapshot.latestScored
+      ? "live-scored"
+      : "live-idle"
+    : result
+      ? `${currentResult?.inputType ?? "analysis"}:${currentResult?.sourceLabel ?? "result"}:${result.latency_ms}`
+      : inFlight
+        ? "analyzing"
+        : "idle";
+  const faceoffPlayKey = !showingLive && currentResult?.audioUrl
+    ? `faceoff-${currentResult.inputType}-${currentResult.sampleId ?? currentResult.sourceLabel}`
+    : null;
+  const playFaceoff = useCallback(() => {
+    if (!currentResult?.audioUrl || !faceoffPlayKey) return;
+    void audioPlayer.playSegment({ key: faceoffPlayKey, src: currentResult.audioUrl, start: 0 });
+  }, [audioPlayer, currentResult?.audioUrl, faceoffPlayKey]);
 
   const liveWarning = useMemo(() => {
     // The caveat belongs to the live-mic input only. In particular, it must
@@ -381,92 +372,101 @@ export default function App() {
       : null;
 
   const sampleError = analysisError?.kind === "sample" ? analysisError.message : null;
-  const uploadError = analysisError && (analysisError.kind === "upload" || analysisError.kind === "url") ? analysisError.message : null;
+  const uploadError = analysisError?.kind === "upload" ? analysisError.message : null;
+  const linkError = analysisError?.kind === "url" ? analysisError.message : null;
 
   return (
-    <div className="min-h-screen bg-[#dceefb] text-[#0f172a]">
-      <div className="mx-auto max-w-6xl px-4 py-5 sm:px-6 sm:py-7">
-        <header className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+    <div className="min-h-screen bg-cb-bg text-cb-text">
+      <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6 sm:py-6">
+        <header className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
           <div className="min-w-0">
-            <h1 className="text-3xl font-semibold tracking-tight text-slate-950">CloakBreak</h1>
-            <p className="mt-1 text-base text-slate-700">Spots cloned voices, even after Opus call compression.</p>
-            {headline ? <p className="mt-2 text-sm font-medium text-slate-700">{headline}</p> : null}
+            <h1 className="text-2xl font-medium tracking-tight text-cb-text">CloakBreak</h1>
+            <p className="mt-1 text-sm text-cb-secondary">Spots cloned voices, even after Opus call compression.</p>
+            {headline ? <p className="mt-2 font-mono text-sm leading-relaxed tabular-nums text-cb-muted">{headline}</p> : null}
           </div>
-          <div className="inline-flex w-fit max-w-full items-center rounded-xl border border-[#d5e2f0] bg-white px-3 py-2 font-mono text-xs tabular-nums text-[#0369a1] shadow-sm" data-testid="backend-chip">
+          <div className="inline-flex w-fit max-w-full items-center rounded-lg border border-cb-border bg-cb-surface px-3 py-2 font-mono text-xs tabular-nums text-cb-muted" data-testid="backend-chip">
             <span className="break-all">{backendChip}</span>
           </div>
         </header>
 
         <main className="space-y-4">
-          <section className="rounded-2xl border border-[#d5e2f0] bg-white p-4 shadow-sm sm:p-5" data-testid="input-card">
-            <Tabs activeTab={activeTab} onChange={setActiveTab} />
-
-            <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
-              <label htmlFor="condition-select" className="text-sm font-semibold text-slate-700">
-                Simulate call channel
-              </label>
-              <select
-                id="condition-select"
-                value={condition}
-                data-testid="condition-select"
-                className="min-h-11 w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#0369a1] focus-visible:ring-offset-2 sm:max-w-xs"
-                onChange={(event) => setCondition(event.target.value as Condition)}
-              >
-                <option value="clean">Clean</option>
-                <option value="opus_16k">Opus 16 kbps (WhatsApp-like)</option>
-                <option value="phone_8k">Phone 8 kHz</option>
-              </select>
-            </div>
-
-            <div className="mt-5 border-t border-[#d5e2f0] pt-5">
-              <div role="tabpanel" id="panel-samples" aria-labelledby="tab-samples" hidden={activeTab !== "samples"}>
-                <SamplesPanel
-                  inFlight={inFlight}
-                  jobProgress={jobProgress}
-                  analysisError={sampleError}
-                  sampleResults={sampleResults}
-                  currentSampleId={!showingLive ? currentResult?.sampleId : undefined}
-                  onAnalyze={analyzeSample}
-                  onShowResult={showSampleResult}
-                  playSegment={audioPlayer.playSegment}
-                  playingKey={audioPlayer.playingKey}
-                />
-              </div>
-              <div role="tabpanel" id="panel-upload" aria-labelledby="tab-upload" hidden={activeTab !== "upload"}>
-                <UploadLinkPanel
-                  inFlight={inFlight}
-                  jobProgress={jobProgress}
-                  analysisError={uploadError}
-                  onAnalyzeUpload={analyzeUpload}
-                  onAnalyzeLink={analyzeLink}
-                />
-              </div>
-              <div role="tabpanel" id="panel-live" aria-labelledby="tab-live" hidden={activeTab !== "live"}>
-                <LiveMicPanel
-                  condition={condition}
-                  snapshot={liveSnapshot}
-                  setSnapshot={setLiveSnapshot}
-                  debugCapture={health?.debug_capture === true}
-                  onLiveStart={() => {
-                    setDisplayMode("live");
-                    setCurrentResult(null);
-                    setSelectedWindowKey(null);
-                    setAnalysisError(null);
-                  }}
-                  onLiveScored={(windowKey) => setSelectedWindowKey(windowKey)}
-                />
+          <section className="cb-card p-3" data-testid="input-card" aria-label="Input controls">
+            <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+              <Tabs activeTab={activeTab} onChange={setActiveTab} />
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center xl:justify-end">
+                <label htmlFor="condition-select" className="whitespace-nowrap text-sm font-medium text-cb-secondary">
+                  Simulate call channel
+                </label>
+                <select
+                  id="condition-select"
+                  value={condition}
+                  data-testid="condition-select"
+                  className="cb-input w-full px-3 py-2 text-sm sm:min-w-64"
+                  onChange={(event) => setCondition(event.target.value as Condition)}
+                >
+                  <option value="clean">Clean</option>
+                  <option value="opus_16k">Opus 16 kbps (WhatsApp-like)</option>
+                  <option value="phone_8k">Phone 8 kHz</option>
+                </select>
               </div>
             </div>
           </section>
 
-          <VerdictCard state={verdictState} score={verdictScore} reason={verdictReason} freshness={freshness} liveWarning={liveWarning} />
-
-          <DetectorCards
+          <Faceoff
+            mode={faceoffMode}
+            cloakVerdict={cloakVerdict}
             cloakScore={detectorCloakScore}
             legacyScore={detectorLegacyScore}
             threshold={result?.threshold ?? health?.threshold ?? liveSnapshot.threshold ?? 0.5}
             baselineLoaded={health?.baseline_loaded === true}
+            summaryLine={faceoffSummary}
+            freshness={freshness}
+            liveWarning={liveWarning}
+            jobProgress={inFlight ? jobProgress : null}
+            canPlay={!showingLive && Boolean(currentResult?.audioUrl)}
+            playKey={faceoffPlayKey}
+            playingKey={audioPlayer.playingKey}
+            onPlay={playFaceoff}
+            revealKey={faceoffRevealKey}
           />
+
+          <section className="cb-card p-4 sm:p-5" aria-label="Input details">
+            <div role="tabpanel" id="panel-samples" aria-labelledby="tab-samples" hidden={activeTab !== "samples"}>
+              <SamplesPanel
+                inFlight={inFlight}
+                jobProgress={jobProgress}
+                analysisError={sampleError}
+                sampleResults={sampleResults}
+                currentSampleId={!showingLive ? currentResult?.sampleId : undefined}
+                onAnalyze={analyzeSample}
+              />
+            </div>
+            <div role="tabpanel" id="panel-upload" aria-labelledby="tab-upload" hidden={activeTab !== "upload"}>
+              <UploadLinkPanel
+                inFlight={inFlight}
+                jobProgress={jobProgress}
+                uploadError={uploadError}
+                linkError={linkError}
+                onAnalyzeUpload={analyzeUpload}
+                onAnalyzeLink={analyzeLink}
+              />
+            </div>
+            <div role="tabpanel" id="panel-live" aria-labelledby="tab-live" hidden={activeTab !== "live"}>
+              <LiveMicPanel
+                condition={condition}
+                snapshot={liveSnapshot}
+                setSnapshot={setLiveSnapshot}
+                debugCapture={health?.debug_capture === true}
+                onLiveStart={() => {
+                  setDisplayMode("live");
+                  setCurrentResult(null);
+                  setSelectedWindowKey(null);
+                  setAnalysisError(null);
+                }}
+                onLiveScored={(windowKey) => setSelectedWindowKey(windowKey)}
+              />
+            </div>
+          </section>
 
           <Timeline
             items={timelineItems}
@@ -474,6 +474,7 @@ export default function App() {
             selectedKey={selectedWindowKey}
             onSelect={onSelectTimelineWindow}
             canPlayAudio={!showingLive && Boolean(currentResult?.audioUrl)}
+            audioUrl={!showingLive ? currentResult?.audioUrl ?? null : null}
             metaText={timelineMeta}
             emptyText={showingLive ? "Start mic to fill the live window timeline." : "Nothing analyzed yet. Scored windows will appear here."}
           />
@@ -483,7 +484,7 @@ export default function App() {
           <HonestLimits facts={facts} />
         </main>
 
-        <footer className="mt-5 space-y-1 font-mono text-xs tabular-nums text-slate-600" data-testid="footer">
+        <footer className="mt-5 space-y-1 font-mono text-xs tabular-nums text-cb-muted" data-testid="footer">
           <p>
             Backend {health?.backend ?? (backendReachable === false ? "unreachable" : "connecting")} · threshold {formatThreshold(result?.threshold ?? health?.threshold ?? liveSnapshot.threshold)} · source {health?.threshold_source ?? "unknown"}
           </p>

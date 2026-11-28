@@ -1,12 +1,10 @@
 export const COLORS = {
-  real: "#15803d",
-  near: "#b45309",
-  clone: "#dc2626",
-  neutral: "#64748b",
-  text: "#0f172a",
-  muted: "#475569",
-  line: "#94a3b8",
-  accent: "#0369a1",
+  real: "#35d07f",
+  clone: "#ff5a64",
+  neutral: "#7d8994",
+  text: "#f3f6f8",
+  muted: "#b6c0ca",
+  line: "#29313b",
 };
 
 export const MINUS = "\u2212";
@@ -17,16 +15,12 @@ export function clamp01(value: number): number {
 
 export function scoreColor(score: number | null | undefined, threshold: number): string {
   if (score == null || !Number.isFinite(score)) return COLORS.neutral;
-  if (score >= threshold) return COLORS.clone;
-  if (score >= 0.75 * threshold) return COLORS.near;
-  return COLORS.real;
+  return score >= threshold ? COLORS.clone : COLORS.real;
 }
 
 export function scoreColorClass(score: number | null | undefined, threshold: number): string {
-  if (score == null || !Number.isFinite(score)) return "text-slate-500";
-  if (score >= threshold) return "text-red-700";
-  if (score >= 0.75 * threshold) return "text-amber-700";
-  return "text-green-700";
+  if (score == null || !Number.isFinite(score)) return "text-cb-muted";
+  return score >= threshold ? "text-cb-clone" : "text-cb-real";
 }
 
 export function verdictWord(score: number | null | undefined, threshold: number): string {
